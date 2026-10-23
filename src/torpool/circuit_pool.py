@@ -1,9 +1,9 @@
 """CircuitPool managing N Tor circuits, per-circuit SOCKS listeners, states, and replacement."""
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-import time
 from typing import Optional
 
 from torpool.config import TorPoolConfig
@@ -83,7 +83,8 @@ class CircuitPool:
     def healthy_circuits(self) -> list[ManagedCircuit]:
         """Return circuits eligible for work (HEALTHY or DEGRADED), sorted fastest first."""
         eligible = [
-            c for c in self._circuits.values()
+            c
+            for c in self._circuits.values()
             if c.state in (CircuitState.HEALTHY, CircuitState.DEGRADED)
         ]
         eligible.sort(
@@ -120,7 +121,9 @@ class CircuitPool:
                     controller=self.controller,
                 )
                 local_port = await listener.start()
-                proxy_url = self.controller.get_socks_proxy_url(s_user, s_pass, listener_port=local_port)
+                proxy_url = self.controller.get_socks_proxy_url(
+                    s_user, s_pass, listener_port=local_port
+                )
 
                 mc = ManagedCircuit(
                     circuit_id=cid,
@@ -197,7 +200,9 @@ class CircuitPool:
                 c.in_use -= 1
                 c.throughput_bps = self.metrics.get_circuit_throughput(circuit_id)
 
-    def transition_state(self, circuit_id: str, new_state: CircuitState, reason: str = "NONE") -> None:
+    def transition_state(
+        self, circuit_id: str, new_state: CircuitState, reason: str = "NONE"
+    ) -> None:
         """Transition a circuit's state and emit CIRCUIT_STATE_CHANGE."""
         c = self._circuits.get(circuit_id)
         if not c or c.state == new_state:
@@ -215,7 +220,9 @@ class CircuitPool:
             healthy_count=self.healthy_count(),
         )
 
-    async def replace(self, circuit_id: str, reason: str, reassigned_chunks: int = 0) -> Optional[ManagedCircuit]:
+    async def replace(
+        self, circuit_id: str, reason: str, reassigned_chunks: int = 0
+    ) -> Optional[ManagedCircuit]:
         """
         Retire a dead/failed circuit, stop its dedicated SOCKS listener, close it via
         CLOSECIRCUIT, and build a fresh replacement without blocking active transfers.
@@ -258,4 +265,3 @@ class CircuitPool:
         for c in circuits:
             await c.kill_socks_listener()
             await asyncio.to_thread(self.controller.close_circuit, c.circuit_id)
-

@@ -10,13 +10,16 @@ makes concurrent chunks use distinct circuits.
 ## Commands
 
 ```bash
-uv sync                                                    # install from uv.lock
+uv sync --frozen                                           # install locked dependencies
+uv run ruff check                                          # lint check (line length 100, py311)
+uv run ruff format --check                                 # format check
+uv run mypy                                                # typecheck src/torpool and tests
 uv run pytest -q                                           # full suite, offline (no Tor/network)
+TORPOOL_INTEGRATION=1 uv run pytest -q                    # optional integration suite
 uv run pytest -q tests/test_torpool.py::test_name          # single test
-uv run python -m py_compile src/torpool/*.py               # syntax check
 ```
 
-There is no CI, lint, typecheck, or formatter config. Do not invent lint commands.
+CI runs on every push and PR via `.github/workflows/ci.yml` running: `uv sync --frozen`, `ruff check`, `ruff format --check`, `mypy`, and `pytest`.
 After changing dependencies: `uv lock` then `uv sync`. Never hand-edit `uv.lock`; the Docker
 build uses `uv sync --frozen`.
 
@@ -26,7 +29,8 @@ Live Tor run (needs a daemon with a password-protected control port and `Isolate
 export TOR_CONTROL_PASSWORD='...'
 uv run torpool doctor --config /path/to/config.toml
 uv run torpool fetch 'https://host/file' --config /path/to/config.toml \
-  --out ./quarantine --circuits 4 --chunk-size 4M -v [--resume] [--sha256 HEX] [--graph]
+  --out ./quarantine --circuits 4 --chunk-size 4M -v [--resume] [--sha256 HEX] [--graph] [--encrypt]
+uv run torpool decrypt ./quarantine/file.enc --out ./recovered.file [--key-file /path/to/key]
 ```
 
 - Default config is `~/.config/torpool/config.toml`; `--config` overrides it.
@@ -39,17 +43,22 @@ uv run torpool fetch 'https://host/file' --config /path/to/config.toml \
 
 - `config.py` — TOML + CLI overrides. Relative `output_dir`/`temp_dir` resolve against the
   **current working directory**, not the config file. Recursively rejects TOML keys named
-  `password`, `control_password`, `tor_control_password`, or `cookie`.
+  `password`, `control_password`, `tor_control_password`, or `cookie`. Validates `--key-file`
+  for non-empty passphrase.
 - `tor_controller.py` — stem wrapper: password auth, `EXTENDCIRCUIT`, `__LeaveStreamsUnattached 1`,
   per-circuit `CircuitSocksListener`, `SOURCE_ADDR` source-port mapping, `CIRC_BW` metrics.
 - `circuit_pool.py` — slot lifecycle, health replacement, listener teardown.
 - `scheduler.py` — work-stealing workers, adaptive chunk splitting for slow circuits, retries,
-  fail-closed pause.
+  pre-download disk space checks via `shutil.disk_usage`, fail-closed pause, and periodic atomic
+  live status emission (`.torpool_status_<id>.json`).
 - `state_store.py` — hidden SQLite resume file at
   `<output_dir>/.torpool_state_<sha256(url)[:16]>.sqlite`; deleted after successful completion.
   When relocating a partial download, move this file with it.
-- `verifier.py` — SHA-256, append-only `manifest.json`, optional AES-256-GCM.
-- `cli.py` — signal handling and teardown order (dashboard, monitor, pool, controller, bus).
+- `verifier.py` — SHA-256, append-only `manifest.json`, AES-256-GCM ciphertext-only download
+  (`EncryptedFileSession`, `EncryptedChunkRecord`), HMAC-SHA256 authenticated index (`.idx`),
+  and `decrypt_file` plaintext recovery to `0600` files.
+- `cli.py` — signal handling and teardown order (dashboard, monitor, pool, controller, bus),
+  `status` command reading live status files, and `decrypt` command.
 
 ## Non-obvious constraints
 
@@ -63,19 +72,19 @@ uv run torpool fetch 'https://host/file' --config /path/to/config.toml \
   `Server.wait_closed()`; Python 3.12+ waits for active connections and will deadlock on an
   in-flight chunk otherwise.
 - The live graph requires **both** stdout and stderr to be TTYs; `ConfigLoader` silently
-  disables it otherwise. Use tmux for live viewing. `torpool status` builds a fresh
-  `MetricsWindow` and does not inspect a running fetch.
-- Ensure `output_dir`/`temp_dir` are on a filesystem with room for the full file. Files are
-  preallocated sparsely, so ENOSPC shows up mid-download (a 3.9 GB job failed on a 3.5 GB
-  `/tmp` tmpfs). Verify free space before starting large jobs.
-- Cross-domain redirects are refused during probing. Pass the final URL directly.
-- `--encrypt` derives its key from `TORPOOL_PASSPHRASE` or a random secret; `key_file` is
-  parsed but currently unused.
+  disables it otherwise. Use tmux for live viewing.
+- `torpool status` checks for active status JSON files written by running fetch jobs in the
+  quarantine output directory. `circuits list/rotate` open fresh Tor control connections and
+  do not control or inspect an in-memory fetch pool.
+- Ensure `output_dir`/`temp_dir` are on a filesystem with room for the full file. A pre-download
+  disk usage check validates free space; runtime ENOSPC raises explicit `DownloadError(disk_full=True)`.
+- Cross-domain redirects are refused during probing; the error instructs the operator to supply
+  the final destination URL directly.
+- `--key-file` is fully implemented: requires an existing, non-empty file with the passphrase.
+- In encrypted downloads (`--encrypt`), only ciphertext and authenticated index exist on disk.
+  No plaintext `.part` files are ever written. Decrypt with `torpool decrypt`.
 - `manifest.json` reports `"status": "VERIFIED"` whenever hashing succeeds; it only compares
   a digest when `--sha256` is supplied. Verify separately when integrity matters.
-- `circuits list/rotate` open a new control connection; they cannot inspect or control an
-  already running `fetch`. `torpool status` does not open Tor at all and only renders an
-  empty fresh dashboard.
 - `argon_torpool.md` is the original design spec, but it is truncated mid-`CircuitPool.close_all()`
   and its `uv.lock` listing is invalid. Treat code, tests, and `uv.lock` as the source of truth.
 - SIGINT during a circuit replacement can make shutdown wait on a non-cancellable control
@@ -94,3 +103,14 @@ uv run torpool fetch 'https://host/file' --config /path/to/config.toml \
 - Quarantine dirs are `0700`, files `0600`; failed hashes are renamed `*.failed.<ts>`.
 - Keep the default test suite offline. Listener tests are real asyncio loopback tests and do
   not contact Tor; do not add network or control-port dependencies to them.
+
+## Standing instructions for any future agent or model work
+
+- Always read `AGENTS.md` and `SECURITY.md` before making changes.
+- When a design choice is ambiguous, choose the more conservative security option.
+- Never re-introduce cookie authentication or accept the control password from CLI arguments or config files.
+- Keep the default test suite offline.
+- Before claiming a change is finished, run `uv run ruff check`, `uv run mypy`, and `uv run pytest`.
+- Update both `README.md` and `SECURITY.md` whenever behaviour that affects OpSec or honesty statements changes.
+- Treat the invariant “one pool slot = one dedicated Tor circuit + one dedicated SOCKS listener” as non-negotiable.
+

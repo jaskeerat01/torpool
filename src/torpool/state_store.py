@@ -1,12 +1,12 @@
 """StateStore: SQLite-backed persistence for chunk completion bitmaps and crash recovery."""
 
-from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from torpool.sanitizer import sanitize_url_for_manifest
@@ -86,10 +86,15 @@ class StateStore:
             conn.execute("DELETE FROM metadata")
             conn.execute("DELETE FROM chunks")
             conn.execute("INSERT INTO metadata (key, value) VALUES ('url', ?)", (clean_url,))
-            conn.execute("INSERT INTO metadata (key, value) VALUES ('total_size', ?)", (str(total_size),))
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('total_size', ?)", (str(total_size),)
+            )
             conn.executemany(
                 "INSERT INTO chunks (chunk_id, start_byte, end_byte, completed, retries) VALUES (?, ?, ?, ?, ?)",
-                [(c.chunk_id, c.start_byte, c.end_byte, int(c.completed), c.retries) for c in chunks],
+                [
+                    (c.chunk_id, c.start_byte, c.end_byte, int(c.completed), c.retries)
+                    for c in chunks
+                ],
             )
             conn.commit()
 

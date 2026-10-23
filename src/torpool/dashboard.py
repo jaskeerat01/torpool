@@ -87,7 +87,9 @@ class Dashboard:
         rows: list[str] = []
         for r in range(height - 1, -1, -1):
             threshold = (r + 0.5) / float(height)
-            line_chars = [fill_char if (v / peak) >= threshold and v > 0 else empty_char for v in tail]
+            line_chars = [
+                fill_char if (v / peak) >= threshold and v > 0 else empty_char for v in tail
+            ]
             rows.append("".join(line_chars))
         return "\n".join(rows)
 

@@ -21,13 +21,41 @@ torpool = "torpool.cli:app"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
+    "hatchling>=1.32.4",
+    "mypy>=2.4.0",
     "pytest>=8.3.5",
     "pytest-asyncio>=0.25.3",
+    "ruff>=0.17.2",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = [
+    "integration: marks tests as requiring live Tor or network environment (run with TORPOOL_INTEGRATION=1)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+files = ["src/torpool", "tests"]
+python_version = "3.11"
+mypy_path = "src"
+explicit_package_bases = true
+warn_return_any = false
+warn_unused_configs = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["stem", "stem.*"]
+ignore_missing_imports = true

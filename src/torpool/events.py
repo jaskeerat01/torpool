@@ -1,13 +1,13 @@
 """EventBus with bounded non-blocking buffer, priority debug dropping, and subscribers."""
 
 import asyncio
+import sys
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-import sys
-import threading
-import time
 from typing import Any, Callable, Optional
 
 from torpool.sanitizer import sanitize_log_text
@@ -146,11 +146,27 @@ class SanitizedLogWriter:
         # Log file records circuit IDs, timing, status codes, and byte counts only.
         msg = f"ts={event.timestamp:.3f} event={et.value}"
         for allowed_key in (
-            "circuit_id", "tor_circuit_id", "old_circuit_id", "new_circuit_id",
-            "attempt", "duration_s", "reason", "healthy_count", "reassigned_chunks",
-            "recovery_s", "chunk_id", "start_byte", "end_byte", "bytes",
-            "throughput_bps", "retries", "status_code", "latency_s",
-            "backoff_s", "completed_bytes", "total_bytes",
+            "circuit_id",
+            "tor_circuit_id",
+            "old_circuit_id",
+            "new_circuit_id",
+            "attempt",
+            "duration_s",
+            "reason",
+            "healthy_count",
+            "reassigned_chunks",
+            "recovery_s",
+            "chunk_id",
+            "start_byte",
+            "end_byte",
+            "bytes",
+            "throughput_bps",
+            "retries",
+            "status_code",
+            "latency_s",
+            "backoff_s",
+            "completed_bytes",
+            "total_bytes",
         ):
             if allowed_key in d:
                 val = d[allowed_key]

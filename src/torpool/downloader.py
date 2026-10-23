@@ -2,10 +2,10 @@
 
 import errno
 import os
-from pathlib import Path
 import secrets
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -19,7 +19,13 @@ from torpool.state_store import ChunkRecord
 class DownloadError(Exception):
     """Raised on chunk transfer failure."""
 
-    def __init__(self, message: str, reason: str = "TRANSFER_ERR", status_code: int = 0, disk_full: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        reason: str = "TRANSFER_ERR",
+        status_code: int = 0,
+        disk_full: bool = False,
+    ) -> None:
         super().__init__(message)
         self.reason = reason
         self.status_code = status_code
@@ -89,7 +95,7 @@ class RangeDownloader:
         """
         orig_host = urlparse(url).hostname
         async with httpx.AsyncClient(
-            proxy=circuit.proxy_url,
+            proxy=circuit.proxy_url if circuit.proxy_url else None,
             timeout=httpx.Timeout(self.config.circuit_timeout),
             headers={"User-Agent": TOR_BROWSER_USER_AGENT},
             follow_redirects=False,
@@ -101,7 +107,8 @@ class RangeDownloader:
                 new_host = urlparse(loc).hostname
                 if new_host and new_host != orig_host:
                     raise DownloadError(
-                        f"Refusing cross-domain redirect to {new_host}",
+                        f"Refusing cross-domain redirect from '{orig_host}' to '{new_host}'. "
+                        "For security, supply the final URL directly to 'torpool fetch'.",
                         reason="CROSS_DOMAIN_REDIRECT",
                     )
 
@@ -129,20 +136,23 @@ class RangeDownloader:
         url: str,
         chunk: ChunkRecord,
         circuit: ManagedCircuit,
-        target_file: Path,
+        target_file: Optional[Path] = None,
+        encrypted_session: Optional[Any] = None,
     ) -> float:
         """
         Download a single byte-range chunk via the circuit's SOCKS5h proxy and write at offset.
+        If encrypted_session is provided, encrypts chunk in memory before writing ciphertext to disk.
         Returns measured chunk throughput in bytes/sec.
         """
         expected_len = chunk.length
         range_header = f"bytes={chunk.start_byte}-{chunk.end_byte}"
         t0 = time.monotonic()
         received = 0
+        chunk_buf = bytearray() if encrypted_session is not None else None
 
         try:
             async with httpx.AsyncClient(
-                proxy=circuit.proxy_url,
+                proxy=circuit.proxy_url if circuit.proxy_url else None,
                 timeout=httpx.Timeout(self.config.circuit_timeout),
                 headers={
                     "User-Agent": TOR_BROWSER_USER_AGENT,
@@ -165,21 +175,33 @@ class RangeDownloader:
                             status_code=resp.status_code,
                         )
 
-                    fd = os.open(target_file, os.O_RDWR)
-                    try:
+                    if encrypted_session is not None:
                         async for data in resp.aiter_bytes(chunk_size=65536):
                             if not data:
                                 continue
                             await self.bandwidth_limiter.consume(len(data))
-                            os.pwrite(fd, data, chunk.start_byte + received)
+                            chunk_buf.extend(data)  # type: ignore[union-attr]
                             received += len(data)
                             self.metrics.record_bytes(circuit.circuit_id, len(data))
-                    finally:
-                        os.close(fd)
+                    else:
+                        assert target_file is not None
+                        fd = os.open(target_file, os.O_RDWR)
+                        try:
+                            async for data in resp.aiter_bytes(chunk_size=65536):
+                                if not data:
+                                    continue
+                                await self.bandwidth_limiter.consume(len(data))
+                                os.pwrite(fd, data, chunk.start_byte + received)
+                                received += len(data)
+                                self.metrics.record_bytes(circuit.circuit_id, len(data))
+                        finally:
+                            os.close(fd)
 
         except OSError as exc:
             if exc.errno == errno.ENOSPC:
-                raise DownloadError("Disk full while writing chunk", reason="DISK_FULL", disk_full=True) from exc
+                raise DownloadError(
+                    "Disk full while writing chunk (ENOSPC)", reason="DISK_FULL", disk_full=True
+                ) from exc
             raise DownloadError(f"I/O error: {exc}", reason="IO_ERROR") from exc
         except DownloadError:
             raise
@@ -194,6 +216,10 @@ class RangeDownloader:
                 reason="SIZE_MISMATCH",
             )
 
+        if encrypted_session is not None and chunk_buf is not None:
+            encrypted_session.write_chunk(chunk, bytes(chunk_buf))
+            chunk_buf.clear()
+
         elapsed = max(0.001, time.monotonic() - t0)
         return float(received) / elapsed
 
@@ -201,19 +227,18 @@ class RangeDownloader:
         self,
         url: str,
         circuit: ManagedCircuit,
-        target_file: Path,
+        target_file: Optional[Path] = None,
+        encrypted_session: Optional[Any] = None,
     ) -> int:
         """
         Single-circuit streaming download fallback when server does not support HTTP Range requests.
         Returns total bytes written.
         """
-        target_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(target_file.parent, 0o700)
         received = 0
 
         try:
             async with httpx.AsyncClient(
-                proxy=circuit.proxy_url,
+                proxy=circuit.proxy_url if circuit.proxy_url else None,
                 timeout=httpx.Timeout(self.config.circuit_timeout),
                 headers={"User-Agent": TOR_BROWSER_USER_AGENT},
                 follow_redirects=False,
@@ -221,21 +246,44 @@ class RangeDownloader:
             ) as client:
                 async with client.stream("GET", url) as resp:
                     resp.raise_for_status()
-                    fd = os.open(target_file, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
-                    try:
-                        os.fchmod(fd, 0o600)
+                    if encrypted_session is not None:
+                        block_idx = 0
                         async for data in resp.aiter_bytes(chunk_size=65536):
                             if not data:
                                 continue
                             await self.bandwidth_limiter.consume(len(data))
-                            os.write(fd, data)
+                            blk_chunk = ChunkRecord(
+                                chunk_id=block_idx,
+                                start_byte=received,
+                                end_byte=received + len(data) - 1,
+                            )
+                            encrypted_session.write_chunk(blk_chunk, data)
+                            block_idx += 1
                             received += len(data)
                             self.metrics.record_bytes(circuit.circuit_id, len(data))
-                    finally:
-                        os.close(fd)
+                    else:
+                        assert target_file is not None
+                        target_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        os.chmod(target_file.parent, 0o700)
+                        fd = os.open(target_file, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+                        try:
+                            os.fchmod(fd, 0o600)
+                            async for data in resp.aiter_bytes(chunk_size=65536):
+                                if not data:
+                                    continue
+                                await self.bandwidth_limiter.consume(len(data))
+                                os.write(fd, data)
+                                received += len(data)
+                                self.metrics.record_bytes(circuit.circuit_id, len(data))
+                        finally:
+                            os.close(fd)
         except OSError as exc:
             if exc.errno == errno.ENOSPC:
-                raise DownloadError("Disk full during streaming download", reason="DISK_FULL", disk_full=True) from exc
+                raise DownloadError(
+                    "Disk full during streaming download (ENOSPC)",
+                    reason="DISK_FULL",
+                    disk_full=True,
+                ) from exc
             raise DownloadError(f"I/O error: {exc}", reason="IO_ERROR") from exc
 
         return received

@@ -35,3 +35,16 @@ def _no_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "no_proxy",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Gate integration tests behind the TORPOOL_INTEGRATION=1 environment variable."""
+    import os
+
+    if os.environ.get("TORPOOL_INTEGRATION") != "1":
+        skip_integration = pytest.mark.skip(
+            reason="Integration tests disabled by default. Set TORPOOL_INTEGRATION=1 to run."
+        )
+        for item in items:
+            if "integration" in item.keywords:
+                item.add_marker(skip_integration)

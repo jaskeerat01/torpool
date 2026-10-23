@@ -5,19 +5,20 @@ SOURCE_ADDR TCP source ports to circuit IDs), and SOCKS_USERNAME circuit tagging
 """
 
 import asyncio
-from dataclasses import dataclass
 import random
 import re
 import secrets
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import stem
 import stem.connection
 from stem import CircStatus, Signal, StreamStatus
-from stem.control import Controller, EventType as StemEventType
+from stem.control import Controller
+from stem.control import EventType as StemEventType
 
 from torpool.config import TorPoolConfig
 from torpool.events import EventBus, EventType
@@ -237,7 +238,9 @@ class TorController:
         """
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            raise TorError(f"Unsupported URL scheme '{parsed.scheme}'. Only http and https are allowed.")
+            raise TorError(
+                f"Unsupported URL scheme '{parsed.scheme}'. Only http and https are allowed."
+            )
         if not parsed.hostname:
             raise TorError("Invalid URL: missing hostname.")
         if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
@@ -259,14 +262,18 @@ class TorController:
         try:
             ctrl = Controller.from_port(address="127.0.0.1", port=self.config.control_port)
         except Exception as exc:
-            raise TorError(f"Unable to reach Tor control port {self.config.control_port}: {exc}") from exc
+            raise TorError(
+                f"Unable to reach Tor control port {self.config.control_port}: {exc}"
+            ) from exc
 
         try:
             proto_info = ctrl.get_protocolinfo()
             auth_methods = getattr(proto_info, "auth_methods", [])
             if not self._password_auth_supported(auth_methods):
                 ctrl.close()
-                raise TorError("Tor daemon is not configured for HashedControlPassword authentication.")
+                raise TorError(
+                    "Tor daemon is not configured for HashedControlPassword authentication."
+                )
 
             ctrl.authenticate(password=password)
         except stem.connection.AuthenticationFailure as exc:
@@ -283,7 +290,9 @@ class TorController:
         bootstrap = ctrl.get_info("status/bootstrap-phase", "")
         if "PROGRESS=100" not in bootstrap:
             ctrl.close()
-            raise TorError(f"Tor is not fully bootstrapped (reported: {bootstrap}). Refusing to start.")
+            raise TorError(
+                f"Tor is not fully bootstrapped (reported: {bootstrap}). Refusing to start."
+            )
 
         circ_est = ctrl.get_info("status/circuit-established", "0")
         if circ_est != "1":
@@ -343,11 +352,13 @@ class TorController:
             statuses = []
 
         guards = [
-            s for s in statuses
+            s
+            for s in statuses
             if "Guard" in getattr(s, "flags", []) and "Running" in getattr(s, "flags", [])
         ]
         exits = [
-            s for s in statuses
+            s
+            for s in statuses
             if "Exit" in getattr(s, "flags", [])
             and "Running" in getattr(s, "flags", [])
             and "BadExit" not in getattr(s, "flags", [])
@@ -356,20 +367,23 @@ class TorController:
 
         if len(guards) >= 1 and len(middles) >= 2 and len(exits) >= 1:
             with self._lock:
-                avail_guards = [g for g in guards if g.fingerprint not in self._used_guards] or guards
+                avail_guards = [
+                    g for g in guards if g.fingerprint not in self._used_guards
+                ] or guards
                 guard = random.choice(avail_guards)
                 self._used_guards.add(guard.fingerprint)
 
                 avail_middles = [
-                    m for m in middles
-                    if m.fingerprint != guard.fingerprint and m.fingerprint not in self._used_middles
+                    m
+                    for m in middles
+                    if m.fingerprint != guard.fingerprint
+                    and m.fingerprint not in self._used_middles
                 ] or [m for m in middles if m.fingerprint != guard.fingerprint]
                 middle = random.choice(avail_middles)
                 self._used_middles.add(middle.fingerprint)
 
             avail_exits = [
-                e for e in exits
-                if e.fingerprint not in (guard.fingerprint, middle.fingerprint)
+                e for e in exits if e.fingerprint not in (guard.fingerprint, middle.fingerprint)
             ] or exits
             exit_relay = random.choice(avail_exits)
 
@@ -454,7 +468,9 @@ class TorController:
             except Exception:
                 pass
 
-    def get_socks_proxy_url(self, socks_user: str, socks_pass: str, listener_port: Optional[int] = None) -> str:
+    def get_socks_proxy_url(
+        self, socks_user: str, socks_pass: str, listener_port: Optional[int] = None
+    ) -> str:
         """
         Return socks5h:// proxy URL for the circuit's dedicated SOCKS listener port
         (or base SocksPort) with unique IsolateSOCKSAuth credentials.
@@ -511,7 +527,9 @@ class TorController:
 
             if src_port is not None and src_port in self._source_port_to_circuit:
                 slot_cid = self._source_port_to_circuit[src_port]
-                s_user = self._source_port_to_socks_user.get(src_port) or self._circuit_to_socks_user.get(slot_cid)
+                s_user = self._source_port_to_socks_user.get(
+                    src_port
+                ) or self._circuit_to_socks_user.get(slot_cid)
                 if stream_id:
                     self._stream_to_slot[stream_id] = slot_cid
                 return slot_cid, s_user
@@ -535,14 +553,14 @@ class TorController:
                     c_user = self._extract_socks_username(c_info)
                     if c_user:
                         with self._lock:
-                            slot_cid = self._socks_cred_to_circuit.get(c_user)
-                            if slot_cid:
+                            resolved_slot = self._socks_cred_to_circuit.get(c_user)
+                            if resolved_slot:
                                 self._socks_user_to_hs_circuit[c_user] = tor_cid
-                                self._slot_to_verified_tor_circuit[slot_cid] = tor_cid
-                                self._actual_tor_circ_to_slot[tor_cid] = slot_cid
+                                self._slot_to_verified_tor_circuit[resolved_slot] = tor_cid
+                                self._actual_tor_circ_to_slot[tor_cid] = resolved_slot
                                 if stream_id:
-                                    self._stream_to_slot[stream_id] = slot_cid
-                                return slot_cid, c_user
+                                    self._stream_to_slot[stream_id] = resolved_slot
+                                return resolved_slot, c_user
                 except Exception:
                     pass
 

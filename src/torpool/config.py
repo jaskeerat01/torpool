@@ -1,10 +1,10 @@
 """Configuration loader reading TOML files, CLI overrides, and environment variables."""
 
-from dataclasses import dataclass, field
 import os
-from pathlib import Path
 import sys
 import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 # Fixed generic User-Agent matching standard Tor Browser release string
@@ -39,7 +39,9 @@ class TorPoolConfig:
     graph_window: int = 120
     log_file: Optional[Path] = None
     authorized_confirmed: bool = False
-    config_path: Path = field(default_factory=lambda: Path.home() / ".config" / "torpool" / "config.toml")
+    config_path: Path = field(
+        default_factory=lambda: Path.home() / ".config" / "torpool" / "config.toml"
+    )
 
     def validate(self) -> None:
         """Validate configuration bounds and security constraints."""
@@ -70,6 +72,35 @@ class TorPoolConfig:
                 "TorPool requires password authentication via TOR_CONTROL_PASSWORD and refuses to start without it."
             )
         return pw
+
+    def get_passphrase(self) -> str:
+        """
+        Retrieve encryption/decryption passphrase.
+        Checks key_file first, then TORPOOL_PASSPHRASE environment variable.
+        If neither is set and stdin is a TTY, prompts interactively.
+        """
+        if self.key_file:
+            kf = Path(self.key_file)
+            if not kf.exists() or not kf.is_file():
+                raise ConfigError(f"Specified key_file does not exist or is not a file: {kf}")
+            passphrase = kf.read_text(encoding="utf-8").strip()
+            if not passphrase:
+                raise ConfigError(f"Specified key_file is empty: {kf}")
+            return passphrase
+
+        env_pw = os.environ.get("TORPOOL_PASSPHRASE")
+        if env_pw:
+            return env_pw
+
+        if sys.stdin.isatty():
+            import typer
+
+            return typer.prompt("Enter encryption/decryption passphrase", hide_input=True)
+
+        raise ConfigError(
+            "Encryption requested but no passphrase supplied via --key-file, "
+            "TORPOOL_PASSPHRASE environment variable, or interactive prompt."
+        )
 
 
 class ConfigLoader:

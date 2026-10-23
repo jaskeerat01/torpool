@@ -24,7 +24,9 @@ class HealthMonitor:
         config: TorPoolConfig,
         pool: CircuitPool,
         event_bus: EventBus,
-        probe_func: Optional[Callable[[ManagedCircuit], asyncio.Future[tuple[bool, float, str]]]] = None,
+        probe_func: Optional[
+            Callable[[ManagedCircuit], asyncio.Future[tuple[bool, float, str]]]
+        ] = None,
     ) -> None:
         self.config = config
         self.pool = pool
@@ -58,23 +60,23 @@ class HealthMonitor:
     async def run_probe_cycle(self) -> None:
         """Execute a single health check cycle across all active circuits."""
         active = [
-            c for c in self.pool.circuits
+            c
+            for c in self.pool.circuits
             if c.state in (CircuitState.HEALTHY, CircuitState.DEGRADED, CircuitState.WARMING)
         ]
         if not active:
             return
 
-        results = await asyncio.gather(*(self._probe_single(c) for c in active), return_exceptions=True)
+        results = await asyncio.gather(
+            *(self._probe_single(c) for c in active), return_exceptions=True
+        )
 
-        latencies = [
-            c.latency_s for c in active
-            if c.consecutive_failures == 0 and c.latency_s > 0
-        ]
+        latencies = [c.latency_s for c in active if c.consecutive_failures == 0 and c.latency_s > 0]
         median_latency = statistics.median(latencies) if latencies else 1.0
 
         replacement_tasks = []
         for c, res in zip(active, results):
-            if isinstance(res, Exception):
+            if isinstance(res, BaseException):
                 ok, lat, reason = False, self.config.circuit_timeout, str(res)
             else:
                 ok, lat, reason = res
@@ -83,9 +85,13 @@ class HealthMonitor:
                 c.consecutive_failures = 0
                 c.latency_s = lat
                 if len(latencies) >= 2 and lat > 3.0 * median_latency:
-                    self.pool.transition_state(c.circuit_id, CircuitState.DEGRADED, reason="HIGH_LATENCY")
+                    self.pool.transition_state(
+                        c.circuit_id, CircuitState.DEGRADED, reason="HIGH_LATENCY"
+                    )
                 else:
-                    self.pool.transition_state(c.circuit_id, CircuitState.HEALTHY, reason="PROBE_OK")
+                    self.pool.transition_state(
+                        c.circuit_id, CircuitState.HEALTHY, reason="PROBE_OK"
+                    )
             else:
                 c.consecutive_failures += 1
                 c.error_count += 1

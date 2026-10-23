@@ -1,10 +1,14 @@
 """ChunkScheduler distributing chunks across healthy circuits with work-stealing and adaptive sizing."""
 
 import asyncio
+import hashlib
+import json
+import os
+import random
+import shutil
+import time
 from collections import deque
 from pathlib import Path
-import random
-import time
 from typing import Optional
 
 from torpool.circuit_pool import CircuitPool, ManagedCircuit
@@ -12,7 +16,9 @@ from torpool.config import TorPoolConfig
 from torpool.downloader import DownloadError, RangeDownloader
 from torpool.events import EventBus, EventType
 from torpool.metrics import MetricsWindow
+from torpool.sanitizer import sanitize_url_for_manifest
 from torpool.state_store import ChunkRecord, StateStore
+from torpool.verifier import EncryptedFileSession
 
 
 class SchedulerError(Exception):
@@ -54,7 +60,9 @@ class ChunkScheduler:
     def trigger_emergency_pause(self, reason: str) -> None:
         """Fail-closed pause triggered on unexpected exit relay change or Tor disconnect."""
         self._paused_error = reason
-        self.event_bus.emit(EventType.SECURITY_ALERT, message=f"Transfer paused: {reason}", reason="FAIL_CLOSED")
+        self.event_bus.emit(
+            EventType.SECURITY_ALERT, message=f"Transfer paused: {reason}", reason="FAIL_CLOSED"
+        )
 
     @staticmethod
     def build_initial_chunks(total_size: int, chunk_size: int) -> list[ChunkRecord]:
@@ -90,6 +98,27 @@ class ChunkScheduler:
         finally:
             await self.pool.release(first_circuit.circuit_id)
 
+        # Check available disk space before allocating or downloading
+        try:
+            usage = shutil.disk_usage(target_file.parent)
+            required_space = total_size + (10 * 1024 * 1024)
+            if usage.free < required_space:
+                raise DownloadError(
+                    f"Insufficient disk space in {target_file.parent}: required {total_size} bytes plus buffer, but only {usage.free} bytes available.",
+                    reason="DISK_FULL",
+                    disk_full=True,
+                )
+        except OSError:
+            pass
+
+        # Prepare encrypted session if encryption requested
+        encrypted_session: Optional[EncryptedFileSession] = None
+        if self.config.encrypt:
+            passphrase = self.config.get_passphrase()
+            enc_file = target_file.with_name(f"{target_file.name}.enc")
+            idx_file = target_file.with_name(f"{target_file.name}.idx")
+            encrypted_session = EncryptedFileSession(enc_file, idx_file, passphrase, total_size)
+
         # Fallback to single-circuit streaming if server does not support byte ranges
         if not supports_ranges or total_size <= 0:
             self.event_bus.emit(
@@ -100,18 +129,29 @@ class ChunkScheduler:
             if not stream_circuit:
                 raise SchedulerError("No healthy circuit available for streaming fallback.")
             try:
-                written = await self.downloader.download_streaming_fallback(url, stream_circuit, target_file)
+                written = await self.downloader.download_streaming_fallback(
+                    url,
+                    stream_circuit,
+                    target_file if not encrypted_session else None,
+                    encrypted_session=encrypted_session,
+                )
+                if encrypted_session:
+                    encrypted_session.finalize()
                 return written
             finally:
                 await self.pool.release(stream_circuit.circuit_id)
 
         # Initialize or resume chunk state
         loaded = self.state_store.load_job() if resume else None
-        if loaded and loaded[0] == total_size and target_file.exists():
+        job_exists = target_file.exists() or (
+            encrypted_session is not None and encrypted_session.enc_path.exists()
+        )
+        if loaded and loaded[0] == total_size and job_exists:
             _, chunks = loaded
         else:
             chunks = self.build_initial_chunks(total_size, self.config.chunk_size)
-            self.downloader.preallocate_file(target_file, total_size)
+            if not encrypted_session:
+                self.downloader.preallocate_file(target_file, total_size)
             self.state_store.initialize_job(url, total_size, chunks)
 
         self._all_chunks = {c.chunk_id: c for c in chunks}
@@ -122,6 +162,8 @@ class ChunkScheduler:
         self.metrics.set_target_size(total_size, initial_completed=already_done_bytes)
 
         if not self._queue:
+            if encrypted_session:
+                encrypted_session.finalize()
             return total_size
 
         # Enforce global concurrency cap = min(healthy_circuits, per_host_concurrency)
@@ -133,10 +175,20 @@ class ChunkScheduler:
         )
 
         workers = [
-            asyncio.create_task(self._worker_loop(url, target_file))
+            asyncio.create_task(
+                self._worker_loop(
+                    url,
+                    target_file if not encrypted_session else None,
+                    encrypted_session=encrypted_session,
+                )
+            )
             for _ in range(concurrency)
         ]
-        summary_task = asyncio.create_task(self._summary_ticker())
+        status_file = (
+            target_file.parent
+            / f".torpool_status_{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}.json"
+        )
+        summary_task = asyncio.create_task(self._summary_ticker(url, status_file))
 
         try:
             await asyncio.gather(*workers)
@@ -146,27 +198,74 @@ class ChunkScheduler:
                 await summary_task
             except asyncio.CancelledError:
                 pass
+            if status_file.exists():
+                try:
+                    status_file.unlink()
+                except Exception:
+                    pass
 
         if self._paused_error:
-            raise SchedulerError(f"Download aborted due to fail-closed condition: {self._paused_error}")
+            raise SchedulerError(
+                f"Download aborted due to fail-closed condition: {self._paused_error}"
+            )
 
         if self._permanent_failures:
             raise SchedulerError(
                 f"{len(self._permanent_failures)} chunk(s) permanently failed after max retries."
             )
 
+        if encrypted_session:
+            encrypted_session.finalize()
+
         return total_size
 
-    async def _summary_ticker(self) -> None:
-        """Emit 1-second throughput ticks and 10-second summary lines."""
+    async def _summary_ticker(self, url: str = "", status_file: Optional[Path] = None) -> None:
+        """Emit 1-second throughput ticks and 10-second summary lines, writing live status file."""
         ticks = 0
         while True:
             await asyncio.sleep(1.0)
             agg_bps = self.metrics.tick_sample()
             self.event_bus.emit(EventType.THROUGHPUT_SAMPLE, throughput_bps=agg_bps)
             ticks += 1
+            snap = self.metrics.get_snapshot()
+
+            if status_file and url:
+                try:
+                    status_data = {
+                        "timestamp": time.time(),
+                        "url": sanitize_url_for_manifest(url),
+                        "total_bytes": snap["total_bytes"],
+                        "completed_bytes": snap["completed_bytes"],
+                        "current_bps": snap["current_bps"],
+                        "peak_bps": snap["peak_bps"],
+                        "avg_bps": snap["avg_bps"],
+                        "eta_s": snap["eta_s"],
+                        "healthy_count": self.pool.healthy_count(),
+                        "circuits": [
+                            {
+                                "circuit_id": c.circuit_id,
+                                "state": c.state.value,
+                                "tor_circuit_id": (
+                                    self.pool.controller.get_verified_tor_circuit(c.circuit_id)
+                                    if self.pool.controller
+                                    else "AUTO"
+                                ),
+                                "throughput_bps": self.metrics.get_circuit_throughput(c.circuit_id),
+                                "latency_s": c.latency_s,
+                            }
+                            for c in self.pool.circuits
+                        ],
+                    }
+                    fd = os.open(status_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+                    try:
+                        os.fchmod(fd, 0o600)
+                        os.write(fd, json.dumps(status_data).encode("utf-8"))
+                    finally:
+                        os.close(fd)
+                except Exception:
+                    pass
+
             if ticks % 10 == 0:
-                snap = self.metrics.get_snapshot()
                 self.event_bus.emit(
                     EventType.SUMMARY_TICK,
                     completed_bytes=snap["completed_bytes"],
@@ -175,7 +274,9 @@ class ChunkScheduler:
                     healthy_count=self.pool.healthy_count(),
                 )
 
-    async def _maybe_adapt_chunk_downward(self, chunk: ChunkRecord, circuit: ManagedCircuit) -> ChunkRecord:
+    async def _maybe_adapt_chunk_downward(
+        self, chunk: ChunkRecord, circuit: ManagedCircuit
+    ) -> ChunkRecord:
         """
         Adapt chunk size downward if the assigned circuit is slower than half the pool average
         and the chunk is at least 2x MIN_ADAPTIVE_CHUNK_SIZE.
@@ -209,7 +310,12 @@ class ChunkScheduler:
             )
         return chunk
 
-    async def _worker_loop(self, url: str, target_file: Path) -> None:
+    async def _worker_loop(
+        self,
+        url: str,
+        target_file: Optional[Path],
+        encrypted_session: Optional[EncryptedFileSession] = None,
+    ) -> None:
         """Work-stealing worker pulling unassigned chunks and executing ranged requests."""
         while not self._paused_error:
             async with self._lock:
@@ -238,7 +344,13 @@ class ChunkScheduler:
 
             try:
                 t_start = time.monotonic()
-                rate_bps = await self.downloader.download_chunk(url, chunk, circuit, target_file)
+                rate_bps = await self.downloader.download_chunk(
+                    url,
+                    chunk,
+                    circuit,
+                    target_file=target_file,
+                    encrypted_session=encrypted_session,
+                )
                 elapsed = time.monotonic() - t_start
 
                 chunk.completed = True
@@ -251,7 +363,11 @@ class ChunkScheduler:
                     end_byte=chunk.end_byte,
                     bytes=chunk.length,
                     circuit_id=circuit.circuit_id,
-                    tor_circuit_id=self.pool.controller.get_verified_tor_circuit(circuit.circuit_id),
+                    tor_circuit_id=(
+                        self.pool.controller.get_verified_tor_circuit(circuit.circuit_id)
+                        if self.pool.controller
+                        else "AUTO"
+                    ),
                     throughput_bps=rate_bps,
                     retries=chunk.retries,
                 )
@@ -290,7 +406,9 @@ class ChunkScheduler:
                 else:
                     # Exponential backoff with jitter for HTTP 429 / 503
                     if exc.status_code in (429, 503):
-                        backoff_s = min(30.0, (2 ** (chunk.retries - 1)) * 0.5 + random.uniform(0.05, 0.25))
+                        backoff_s = min(
+                            30.0, (2 ** (chunk.retries - 1)) * 0.5 + random.uniform(0.05, 0.25)
+                        )
                         self.event_bus.emit(
                             EventType.CHUNK_RETRY,
                             chunk_id=chunk.chunk_id,
@@ -319,7 +437,9 @@ class ChunkScheduler:
                         async with self._lock:
                             self._queue.appendleft(chunk)
                         asyncio.create_task(
-                            self.pool.replace(circuit.circuit_id, reason=exc.reason, reassigned_chunks=1)
+                            self.pool.replace(
+                                circuit.circuit_id, reason=exc.reason, reassigned_chunks=1
+                            )
                         )
             finally:
                 await self.pool.release(circuit.circuit_id)

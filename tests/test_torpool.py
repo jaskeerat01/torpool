@@ -1,28 +1,31 @@
 """Offline unit tests for TorPool."""
 
 import asyncio
-import json
+import errno
 import hashlib
+import json
 import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from typer.testing import CliRunner
 
 from torpool import __version__
-from torpool.cli import parse_size
 from torpool.circuit_pool import CircuitPool, CircuitState, ManagedCircuit
+from torpool.cli import app, parse_size
 from torpool.config import (
+    TOR_BROWSER_USER_AGENT,
     ConfigError,
     ConfigLoader,
-    TOR_BROWSER_USER_AGENT,
     TorPoolConfig,
 )
 from torpool.dashboard import Dashboard
-from torpool.downloader import RangeDownloader
+from torpool.downloader import DownloadError, RangeDownloader
 from torpool.events import (
     Event,
     EventBus,
@@ -39,7 +42,7 @@ from torpool.sanitizer import (
 from torpool.scheduler import ChunkScheduler
 from torpool.state_store import ChunkRecord, StateStore
 from torpool.tor_controller import CircuitSocksListener, RelayInfo, TorController, TorError
-from torpool.verifier import IntegrityVerifier
+from torpool.verifier import EncryptedFileSession, IntegrityVerifier, VerificationError
 
 
 def test_version() -> None:
@@ -242,25 +245,25 @@ def test_terminal_renderer_verbosity_levels() -> None:
         },
     )
     assert quiet.format_event(state_event) is None
-    assert "CIRCUIT" in default.format_event(state_event)
-    assert "CIRCUIT" in verbose.format_event(state_event)
+    assert "CIRCUIT" in (default.format_event(state_event) or "")
+    assert "CIRCUIT" in (verbose.format_event(state_event) or "")
 
     build_event = Event(
         event_type=EventType.CIRCUIT_BUILD_START,
         data={"attempt": 1, "path_str": "A -> B -> C"},
     )
     assert default.format_event(build_event) is None
-    assert "BUILD_START" in verbose.format_event(build_event)
+    assert "BUILD_START" in (verbose.format_event(build_event) or "")
 
     timing_event = Event(
         event_type=EventType.DEBUG_TIMING,
         data={"phase": "chunk_1", "duration_s": 1.5},
     )
     assert verbose.format_event(timing_event) is None
-    assert "DEBUG:TIMING" in debug.format_event(timing_event)
+    assert "DEBUG:TIMING" in (debug.format_event(timing_event) or "")
 
     error_event = Event(event_type=EventType.ERROR, data={"message": "boom"})
-    assert "boom" in quiet.format_event(error_event)
+    assert "boom" in (quiet.format_event(error_event) or "")
 
 
 # -------------------------------------------------------------------------- metrics
@@ -324,7 +327,9 @@ def test_state_store_roundtrip_and_resume(tmp_path: Path) -> None:
     updated = records[1]
     updated.end_byte = 14
     store.update_chunk_split(updated, split)
-    _, after_split = store.load_job()
+    loaded_after = store.load_job()
+    assert loaded_after is not None
+    _, after_split = loaded_after
     assert [c.chunk_id for c in after_split] == [0, 1, 2]
     assert after_split[2].start_byte == 15
 
@@ -379,7 +384,14 @@ def test_url_opsec_rejects_unsafe_inputs() -> None:
     TorController.validate_url_opsec("https://example.onion/file")
     TorController.validate_url_opsec("http://example.com/file")
 
-    for bad in ("file:///etc/passwd", "ftp://example.com/x", "http://localhost/x", "http://127.0.0.1/x", "http://[::1]/x", "http:///nohost"):
+    for bad in (
+        "file:///etc/passwd",
+        "ftp://example.com/x",
+        "http://localhost/x",
+        "http://127.0.0.1/x",
+        "http://[::1]/x",
+        "http:///nohost",
+    ):
         with pytest.raises(TorError):
             TorController.validate_url_opsec(bad)
 
@@ -501,6 +513,7 @@ def test_dashboard_chart_and_compact_frame() -> None:
 
 
 # ------------------------------------------------------------------------ rendering
+
 
 def test_tor_browser_user_agent_is_generic() -> None:
     assert "Mozilla/5.0" in TOR_BROWSER_USER_AGENT
@@ -733,3 +746,297 @@ def test_chunk_done_renders_verified_tor_circuit() -> None:
     assert "circuit=slot-1" in line
     assert "tor_circ=tor-77" in line
 
+
+# -------------------------------------------------------------------------- encryption model & decrypt CLI
+
+
+def test_encrypted_session_produces_no_plaintext_part(tmp_path: Path) -> None:
+    enc_file = tmp_path / "payload.bin.enc"
+    idx_file = tmp_path / "payload.bin.idx"
+    passphrase = "correct_horse_battery_staple"
+
+    part1 = b"Hello TorPool part 1 " * 20
+    part2 = b"Hello TorPool part 2 " * 30
+    total_size = len(part1) + len(part2)
+
+    session = EncryptedFileSession(enc_file, idx_file, passphrase=passphrase, total_size=total_size)
+    c1 = ChunkRecord(0, 0, len(part1) - 1)
+    c2 = ChunkRecord(1, len(part1), total_size - 1)
+    session.write_chunk(c1, part1)
+    session.write_chunk(c2, part2)
+    session.finalize()
+
+    # Invariant: No plaintext or .part files on disk
+    assert enc_file.exists()
+    assert idx_file.exists()
+    for f in tmp_path.iterdir():
+        assert not f.name.endswith(".part")
+        assert not f.name.endswith(".bin")
+
+    # Decrypt to user-chosen path
+    recovered_file = tmp_path / "decrypted_recovered.bin"
+    _, recovered_sha = IntegrityVerifier.decrypt_file(
+        enc_file, recovered_file, passphrase=passphrase, idx_path=idx_file
+    )
+
+    assert recovered_file.exists()
+    assert (recovered_file.stat().st_mode & 0o777) == 0o600
+    expected_bytes = part1 + part2
+    assert recovered_file.read_bytes() == expected_bytes
+    assert hashlib.sha256(expected_bytes).hexdigest() == recovered_sha
+
+    # Wrong passphrase must fail
+    wrong_out = tmp_path / "wrong.bin"
+    with pytest.raises(VerificationError, match="Index authentication failed"):
+        IntegrityVerifier.decrypt_file(
+            enc_file, wrong_out, passphrase="wrong_passphrase", idx_path=idx_file
+        )
+
+
+def test_encrypted_tamper_detection(tmp_path: Path) -> None:
+    enc_file = tmp_path / "tamper_test.bin.enc"
+    idx_file = tmp_path / "tamper_test.bin.idx"
+    passphrase = "super_secret_tamper_test"
+    data = b"Sensitive ciphertext content" * 10
+
+    session = EncryptedFileSession(enc_file, idx_file, passphrase=passphrase, total_size=len(data))
+    chunk = ChunkRecord(0, 0, len(data) - 1)
+    session.write_chunk(chunk, data)
+    session.finalize()
+
+    # 1. Tamper with index HMAC
+    parsed = json.loads(idx_file.read_text(encoding="utf-8"))
+    parsed["hmac"] = "00" * 32
+    bad_idx = tmp_path / "bad.idx"
+    bad_idx.write_text(json.dumps(parsed), encoding="utf-8")
+
+    out_file = tmp_path / "tampered.out"
+    with pytest.raises(VerificationError, match="Index authentication failed"):
+        IntegrityVerifier.decrypt_file(enc_file, out_file, passphrase=passphrase, idx_path=bad_idx)
+
+    # 2. Tamper with ciphertext bytes
+    enc_content = bytearray(enc_file.read_bytes())
+    enc_content[-1] ^= 0xFF
+    bad_enc = tmp_path / "bad.enc"
+    bad_enc.write_bytes(bytes(enc_content))
+
+    with pytest.raises(VerificationError, match="Decryption failed for chunk"):
+        IntegrityVerifier.decrypt_file(bad_enc, out_file, passphrase=passphrase, idx_path=idx_file)
+
+
+def test_torpool_decrypt_cli_command(tmp_path: Path) -> None:
+    runner = CliRunner()
+    enc_file = tmp_path / "artifact.enc"
+    idx_file = tmp_path / "artifact.idx"
+    out_file = tmp_path / "recovered.bin"
+    key_file = tmp_path / "key.txt"
+    passphrase = "my_cli_passphrase_123"
+    key_file.write_text(passphrase + "\n", encoding="utf-8")
+
+    content = b"Data processed through TorPool encrypted pipeline"
+    session = EncryptedFileSession(
+        enc_file, idx_file, passphrase=passphrase, total_size=len(content)
+    )
+    chunk = ChunkRecord(0, 0, len(content) - 1)
+    session.write_chunk(chunk, content)
+    session.finalize()
+    assert idx_file.exists()
+
+    # Test with --key-file
+    result = runner.invoke(
+        app,
+        ["decrypt", str(enc_file), "--out", str(out_file), "--key-file", str(key_file)],
+    )
+    assert result.exit_code == 0
+    assert out_file.read_bytes() == content
+    assert (out_file.stat().st_mode & 0o777) == 0o600
+
+    out_file.unlink()
+
+    # Test with TORPOOL_PASSPHRASE env var
+    with patch.dict(os.environ, {"TORPOOL_PASSPHRASE": passphrase}):
+        result = runner.invoke(app, ["decrypt", str(enc_file), "--out", str(out_file)])
+        assert result.exit_code == 0
+        assert out_file.read_bytes() == content
+
+    # Test non-existent key file
+    result = runner.invoke(
+        app,
+        [
+            "decrypt",
+            str(enc_file),
+            "--out",
+            str(out_file),
+            "--key-file",
+            str(tmp_path / "missing.txt"),
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_key_file_validation_in_config(tmp_path: Path) -> None:
+    non_existent = tmp_path / "absent_key.txt"
+    cfg = TorPoolConfig(key_file=non_existent)
+    with pytest.raises(ConfigError, match="Specified key_file does not exist"):
+        cfg.get_passphrase()
+
+    empty_key = tmp_path / "empty_key.txt"
+    empty_key.write_text("   \n", encoding="utf-8")
+    cfg_empty = TorPoolConfig(key_file=empty_key)
+    with pytest.raises(ConfigError, match="is empty"):
+        cfg_empty.get_passphrase()
+
+    valid_key = tmp_path / "valid_key.txt"
+    valid_key.write_text("secure_phrase_from_file\n", encoding="utf-8")
+    cfg_valid = TorPoolConfig(key_file=valid_key)
+    assert cfg_valid.get_passphrase() == "secure_phrase_from_file"
+
+
+# -------------------------------------------------------------------------- disk space & redirect errors
+
+
+@pytest.mark.asyncio
+async def test_pre_download_disk_space_check(tmp_path: Path) -> None:
+    bus = EventBus()
+    store = StateStore(tmp_path / "state.sqlite")
+    metrics = MetricsWindow()
+    limiter = BandwidthLimiter(0)
+    cfg = TorPoolConfig(output_dir=tmp_path, temp_dir=tmp_path)
+    downloader = RangeDownloader(cfg, metrics, limiter)
+    pool = CircuitPool(cfg, MagicMock(spec=TorController), bus, metrics)
+
+    scheduler = ChunkScheduler(
+        config=cfg,
+        pool=pool,
+        downloader=downloader,
+        event_bus=bus,
+        state_store=store,
+        metrics=metrics,
+    )
+
+    dummy_circuit = ManagedCircuit(
+        circuit_id="probe-circ",
+        created_at=0.0,
+        relay_path=[],
+        socks_user="u",
+        socks_pass="p",
+        proxy_url="socks5h://127.0.0.1:9050",
+    )
+    with (
+        patch.object(pool, "acquire", return_value=dummy_circuit),
+        patch.object(pool, "release"),
+        patch.object(downloader, "probe_target", return_value=(2048, True)),
+        patch("shutil.disk_usage", return_value=MagicMock(free=512)),
+    ):
+        with pytest.raises(DownloadError, match="Insufficient disk space") as exc_info:
+            await scheduler.execute_download("https://example.com/file", tmp_path / "target.bin")
+        assert exc_info.value.disk_full is True
+
+
+@pytest.mark.asyncio
+async def test_range_downloader_enospc_handling(tmp_path: Path) -> None:
+    metrics = MetricsWindow()
+    limiter = BandwidthLimiter(0)
+    cfg = TorPoolConfig()
+    downloader = RangeDownloader(cfg, metrics, limiter)
+    target = tmp_path / "enospc_target.bin"
+    target.touch()
+
+    circuit = ManagedCircuit(
+        circuit_id="test-slot",
+        created_at=0.0,
+        relay_path=[],
+        socks_user="u",
+        socks_pass="p",
+        proxy_url="socks5h://127.0.0.1:9050",
+    )
+    chunk = ChunkRecord(0, 0, 99)
+
+    class MockStreamContext:
+        def __init__(self, data: bytes):
+            self.data = data
+
+        async def __aenter__(self):
+            resp = MagicMock()
+            resp.status_code = 206
+
+            async def aiter(chunk_size: int = 65536):
+                yield self.data
+
+            resp.aiter_bytes = aiter
+            return resp
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with (
+        patch("httpx.AsyncClient.stream", return_value=MockStreamContext(b"X" * 100)),
+        patch("os.open", side_effect=OSError(errno.ENOSPC, "No space left on device")),
+    ):
+        with pytest.raises(DownloadError, match="Disk full while writing chunk") as exc_info:
+            await downloader.download_chunk(
+                "https://example.com/chunk", chunk, circuit, target_file=target
+            )
+        assert exc_info.value.disk_full is True
+
+
+@pytest.mark.asyncio
+async def test_cross_domain_redirect_guidance() -> None:
+    metrics = MetricsWindow()
+    limiter = BandwidthLimiter(0)
+    cfg = TorPoolConfig()
+    downloader = RangeDownloader(cfg, metrics, limiter)
+    circuit = ManagedCircuit(
+        circuit_id="test-slot",
+        created_at=0.0,
+        relay_path=[],
+        socks_user="u",
+        socks_pass="p",
+        proxy_url="socks5h://127.0.0.1:9050",
+    )
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 302
+    mock_resp.headers = {"Location": "https://otherdomain.com/final_file.bin"}
+
+    with patch("httpx.AsyncClient.head", return_value=mock_resp):
+        with pytest.raises(DownloadError, match="supply the final URL directly"):
+            await downloader.probe_target("https://initialdomain.com/start_file.bin", circuit)
+
+
+# -------------------------------------------------------------------------- live status reporting
+
+
+def test_live_status_reporting_and_cli(tmp_path: Path) -> None:
+    runner = CliRunner()
+    quarantine_dir = tmp_path / "quarantine"
+    quarantine_dir.mkdir(parents=True, mode=0o700)
+
+    status_file = quarantine_dir / ".torpool_status_abc123.json"
+    status_data = {
+        "url": "https://example.onion/secure_file.iso",
+        "total_bytes": 1048576,
+        "completed_bytes": 524288,
+        "current_bps": 204800.0,
+        "peak_bps": 409600.0,
+        "avg_bps": 204800.0,
+        "eta_s": 2.5,
+        "healthy_count": 4,
+        "circuits": [
+            {
+                "circuit_id": "slot-0",
+                "state": "healthy",
+                "tor_circuit_id": "tor-99",
+                "throughput_bps": 102400.0,
+                "latency_s": 0.15,
+            }
+        ],
+    }
+    status_file.write_text(json.dumps(status_data), encoding="utf-8")
+
+    result = runner.invoke(app, ["status", "--out", str(quarantine_dir)])
+    assert result.exit_code == 0
+    assert "Live Download Status" in result.output
+    assert "https://example.onion/secure_file.iso" in result.output
+    assert "slot-0" in result.output
+    assert "tor-99" in result.output

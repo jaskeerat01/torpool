@@ -124,8 +124,15 @@ uv run torpool fetch "https://example.org/published-research-dump.bin" \
   --new-identity \
   -vv
 
-# 7. Inspect active Tor circuits, rotate a specific circuit, view status, or verify a file offline
-uv run torpool status --graph
+# 7. Decrypt a downloaded ciphertext-only quarantine artifact to a destination file with 0600 permissions
+uv run torpool decrypt ./quarantine/published-research-dump.bin.enc \
+  --out ./quarantine/recovered.bin \
+  --key-file ./secret_key.txt
+
+# 8. Inspect live download progress, rotate circuits, or verify file integrity
+# Note: 'torpool status' inspects atomic live-status files written by active fetch jobs.
+# 'torpool circuits list/rotate' open fresh Tor control connections and do not alter in-flight fetch sessions.
+uv run torpool status
 uv run torpool circuits list
 uv run torpool circuits rotate 12
 uv run torpool verify ./quarantine/published-research-dump.bin --sha256 <EXPECTED_SHA256>
@@ -145,6 +152,39 @@ docker run --rm -it \
   torpool:latest fetch "https://example.org/published-research-dump.bin" \
   --circuits 4 --out /quarantine -v --graph
 ```
+
+---
+
+## Development & Quality Gates
+
+TorPool maintains automated quality gates running in GitHub Actions CI on every push and pull request. All checks can be executed locally with `uv`:
+
+```bash
+# Sync exact locked dependencies
+uv sync --frozen
+
+# Lint and check style rules (line-length 100, py311 target)
+uv run ruff check
+
+# Verify formatting
+uv run ruff format --check
+
+# Static type checking
+uv run mypy
+
+# Run default offline test suite (zero network access, runs in ~1s)
+uv run pytest -q
+```
+
+---
+
+## Stability
+
+TorPool remains on `0.1.x` while encryption pipelines, live status coordination, and the integration harness settle.
+
+- **Stable**: The CLI command structure, configuration schema (`config.toml`), `--key-file` semantics, and SQLite resume format (`.torpool_state_*.sqlite`) are stable across 0.1.x.
+- **Subject to Refinement**: Low-level adaptive chunk scheduling heuristics and internal telemetry IPC will evolve as we approach 0.2.0.
+- **Packaging**: The `uv.lock` lockfile is strictly version-controlled and reproducible. Docker builds enforce `uv sync --frozen`.
 
 ---
 
@@ -195,22 +235,35 @@ Operators must account for the following realities when using `torpool` (see [`S
 4. **Circuit Replacement Caveat**: Replacing a failed or degraded circuit does not guarantee that Tor will select a different exit relay.
 5. **No Absolute Anonymity**: Tor does not guarantee absolute anonymity. Operators remain vulnerable to endpoint compromise, timing correlation, and operational mistakes (such as leaking target URLs in shell history or terminal scrollback).
 6. **SHA-256 Integrity vs. Authenticity**: A locally calculated `SHA-256` hash does not prove that a file is authentic or benign; it only confirms that the bytes received match the expected hash when one is supplied. Downloaded files are never executed, unpacked, or parsed by `torpool` and are written strictly to `0700` quarantine storage.
+7. **Circuit List/Rotate Limitation**: `torpool circuits list` and `rotate` connect to Tor directly; they do not observe or manipulate the in-memory pool of a running fetch process.
 
 ---
 
 ## Security & OpSec Model
 
 - **Tor-Only Routing & Fail-Closed Startup**: Refuses to start if the Tor control port is unreachable, `TOR_CONTROL_PASSWORD` authentication fails, or Tor is not 100% bootstrapped (`PROGRESS=100`). Clears `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables and never falls back to a direct connection.
+- **Ciphertext-Only Downloading (`--encrypt`)**: Every chunk is encrypted with AES-256-GCM in memory prior to being written to disk. Only ciphertext and an HMAC-SHA256 authenticated index (`.idx`) exist on disk. No plaintext `.part` files are ever created. Plaintext is recovered only when the operator runs `torpool decrypt`. Passphrases are never stored or logged.
 - **Zero Local DNS Leaks**: Enforces `socks5h://` on every request so all hostname resolution occurs inside the Tor network, and refuses `localhost`/`127.0.0.1`/`::1` targets.
+- **Pre-download Space Checks**: Verifies filesystem capacity via `shutil.disk_usage` before preallocating storage and surfaces actionable errors on `ENOSPC`.
+- **Fail-Closed Redirect Guidance**: Cross-domain redirects are rejected during probing; error instructions prompt the operator to supply the destination URL directly.
 - **Fingerprinting Defense**: Uses the fixed Tor Browser User-Agent (`Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0`), sends no custom headers or cookies, and refuses cross-domain redirects.
 - **Log & Manifest Sanitization**: Strips query tokens (`token`, `key`, `sig`, `auth`, `password`, `secret`), embedded credentials, local IPv4 addresses, OS usernames, relay fingerprints, and `TOR_CONTROL_PASSWORD` before writing logs or manifests. Temporary files are overwritten with random bytes (`shred_file`) before unlinking.
 
 ---
 
-## Running the Test Suite
+## Testing
 
-All tests are executed via `uv run pytest`:
+### Offline Test Suite (Default)
+The default test suite is completely offline, requires no network access or running Tor daemon, and executes in ~1 second:
 
 ```bash
-uv run pytest -v
+uv run pytest -q
 ```
+
+### Integration Test Suite (Optional)
+TorPool includes an optional integration suite gated behind `TORPOOL_INTEGRATION=1`. It provides a local range-request HTTP server, SOCKS5 remote domain ATYP leak validation, dynamic file generators, and Tor harness fixtures. See [`tests/README.md`](./tests/README.md) for full instructions:
+
+```bash
+TORPOOL_INTEGRATION=1 uv run pytest -q
+```
+

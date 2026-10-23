@@ -1,10 +1,10 @@
 """MetricsWindow: Rolling-window throughput sampler and global bandwidth token-bucket limiter."""
 
 import asyncio
-from collections import deque
 import threading
 import time
-from typing import Optional
+from collections import deque
+from typing import Any, Optional
 
 
 class MetricsWindow:
@@ -56,7 +56,9 @@ class MetricsWindow:
     def record_control_port_bw(self, circuit_id: str, read_bytes: int) -> None:
         """Record Tor control-port CIRC_BW / STREAM_BW verified bytes for a circuit."""
         with self._lock:
-            self._control_port_bytes[circuit_id] = self._control_port_bytes.get(circuit_id, 0) + read_bytes
+            self._control_port_bytes[circuit_id] = (
+                self._control_port_bytes.get(circuit_id, 0) + read_bytes
+            )
 
     def get_control_port_bytes(self, circuit_id: str) -> int:
         """Return total bytes reported directly by Tor control-port events for circuit_id."""
@@ -79,7 +81,9 @@ class MetricsWindow:
         ts = now if now is not None else time.monotonic()
         with self._lock:
             self._prune_locked(ts)
-            agg_rate = self._compute_rate_locked(self._raw_aggregate_bytes, ts, self.rolling_avg_seconds)
+            agg_rate = self._compute_rate_locked(
+                self._raw_aggregate_bytes, ts, self.rolling_avg_seconds
+            )
             self._aggregate_history.append(agg_rate)
             if agg_rate > self._peak_aggregate_bps:
                 self._peak_aggregate_bps = agg_rate
@@ -109,13 +113,17 @@ class MetricsWindow:
         """Return rolling aggregate throughput (bytes/sec) over the rolling window."""
         ts = now if now is not None else time.monotonic()
         with self._lock:
-            return self._compute_rate_locked(self._raw_aggregate_bytes, ts, self.rolling_avg_seconds)
+            return self._compute_rate_locked(
+                self._raw_aggregate_bytes, ts, self.rolling_avg_seconds
+            )
 
-    def get_snapshot(self) -> dict[str, object]:
+    def get_snapshot(self) -> dict[str, Any]:
         """Return a thread-safe snapshot for the Dashboard or status command."""
         now = time.monotonic()
         with self._lock:
-            current_bps = self._compute_rate_locked(self._raw_aggregate_bytes, now, self.rolling_avg_seconds)
+            current_bps = self._compute_rate_locked(
+                self._raw_aggregate_bytes, now, self.rolling_avg_seconds
+            )
             hist = list(self._aggregate_history)
             avg_bps = sum(hist) / len(hist) if hist else current_bps
             remaining = max(0, self._total_bytes_target - self._total_bytes_completed)

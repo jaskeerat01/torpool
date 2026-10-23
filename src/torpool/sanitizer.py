@@ -5,7 +5,16 @@ import re
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-SENSITIVE_QUERY_KEYS = ("token", "key", "sig", "auth", "password", "secret", "session", "credential")
+SENSITIVE_QUERY_KEYS = (
+    "token",
+    "key",
+    "sig",
+    "auth",
+    "password",
+    "secret",
+    "session",
+    "credential",
+)
 IPV4_REGEX = re.compile(
     r"\b(?:127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[0-1])\.\d+\.\d+)\b"
 )
@@ -77,8 +86,14 @@ def sanitize_log_text(text: str, control_password: Optional[str] = None) -> str:
 def clear_proxy_env() -> None:
     """Disable proxy environment variables that could leak traffic or override Tor SOCKS."""
     proxy_vars = [
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
     ]
     for var in proxy_vars:
         os.environ.pop(var, None)
