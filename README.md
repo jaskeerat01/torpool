@@ -1,140 +1,216 @@
 # TorPool
 
-Multi-circuit Tor range-downloader for **authorized** defensive threat-intelligence analysis.
+Multi-circuit Tor byte-range file downloader in Python 3.11+ for defensive threat-intelligence analysis. `torpool` pools several isolated Tor circuits, monitors their health in the background, replaces failed or degraded circuits without stalling active transfers, and combines their throughput into a single download written to encrypted quarantine storage.
 
-TorPool builds a pool of dedicated, explicitly selected Tor circuits and spreads a single
-byte-range download across them. It is designed for retrieving content that you are
-legally and contractually authorized to access, such as your own organization's data,
-published research datasets, or sources covered by a formal data-sharing agreement.
+---
 
-> **Authorization is mandatory.** Read `SECURITY.md` and the in-tool authorization notice
-> before use. Do not use TorPool to evade access controls or to obtain data you have no
-> right to access.
+## Source Restriction & Authorization Notice
+
+> **AUTHORIZED USE ONLY**: This tool is strictly for retrieving content that the operator is legally and contractually authorized to access—such as their organization’s own data, published research datasets, or sources covered by a formal data-sharing agreement for defensive threat-intelligence analysis.
+>
+> Operators must **never** use `torpool` to obtain data from sources they have no right to access, register or log into illicit marketplaces or forums, interact with vendors, crawl/index URLs, or bypass access controls.
+
+On first run (or when running `uv run torpool init`), `torpool` displays the authorization notice below and requires explicit operator confirmation before any network activity can occur:
+
+```text
+================================================================================
+                        TORPOOL AUTHORIZATION NOTICE
+================================================================================
+This tool is strictly for retrieving content that you (the operator) are
+legally and contractually authorized to access—such as your organization's own
+data, published research datasets, or sources covered by a formal data-sharing
+agreement for defensive threat-intelligence analysis.
+
+You must NOT use this tool to obtain data from sources you have no right to
+access, interact with illicit marketplaces, or evade access controls.
+================================================================================
+```
+
+---
 
 ## Features
 
-- Multiple parallel Tor circuits built with explicit 3-hop paths (`EXTENDCIRCUIT`).
-- One dedicated local SOCKS5 listener per circuit, correlating Tor's `SOURCE_ADDR`
-  stream port back to the exact circuit slot, so concurrent chunks really use separate
-  circuits (not just separate credentials on one circuit).
-- Per-circuit SOCKS credentials with `IsolateSOCKSAuth` and `socks5h://` (DNS resolved
-  inside Tor).
-- Control-port verification with `SOCKS_USERNAME` circuit tagging and `CIRC_BW` byte
-  counters, plus verified Tor circuit IDs in verbose chunk output.
-- Resumable byte-range downloads with SQLite chunk tracking and adaptive chunk splitting.
-- Background health probes with automatic, non-blocking circuit replacement.
-- Rolling-window throughput metrics and an optional live terminal bandwidth graph.
-- SHA-256 verification, quarantine manifests, and optional AES-256-GCM encryption at rest.
-- Sanitized operational logging: secrets, fingerprints, URLs, and local addresses are
-  never written to the log file.
+- **Pooled Tor Circuits**: Builds `N` circuits (`1..16`, default `4`) via `EXTENDCIRCUIT` with distinct Guard and Middle relays where consensus allows.
+- **True Per-Circuit Stream Isolation**: Each pooled circuit runs its own dedicated local SOCKS5 listener (`CircuitSocksListener`) with unique `IsolateSOCKSAuth` credentials. The listener records the exact outbound TCP source port (`SOURCE_ADDR=127.0.0.1:<port>`) before forwarding the SOCKS5 handshake to Tor, and correlates Tor's `SOCKS_USERNAME` circuit tags and `STREAM SUCCEEDED` / `CIRC_BW` events so streams never collapse onto a single circuit.
+- **Continuous Health Monitoring**: Background `HealthMonitor` probes each circuit every `health_interval`, marking circuits `degraded` after 2 consecutive failures or latency `> 3×` the pool median, and `dead` after 3 consecutive failures or a timeout. Dead circuits are closed via `CLOSECIRCUIT` and replaced asynchronously without blocking active chunk downloads.
+- **Work-Stealing Range Scheduler**: Splits downloads into HTTP `Range: bytes=start-end` chunks, assigns chunks to the fastest healthy circuits, adapts chunk sizes downward for slow circuits, and falls back to single-circuit streaming if the server does not support HTTP range requests.
+- **Crash-Safe Resume**: Persists the chunk completion bitmap and job metadata in a `0600` SQLite state store so interrupted downloads (`SIGINT`/`SIGTERM`) resume cleanly without re-downloading finished chunks.
+- **Quarantine & At-Rest Encryption**: Writes all downloaded files to a `0700` quarantine directory with `0600` file permissions, verifies `SHA-256` digests, writes a sanitized `manifest.json`, and supports optional `AES-256-GCM` encryption at rest (`--encrypt`).
+- **Live Terminal Telemetry**: Non-blocking `EventBus` and `MetricsWindow` power real-time verbose progress on `stderr` and an optional live Unicode/ASCII terminal bandwidth graph (`--graph`).
+
+---
 
 ## Requirements
 
-- Python 3.11+
-- A local Tor daemon with:
-  - `ControlPort 9051` configured with `HashedControlPassword`
-  - `SocksPort 9050 IsolateSOCKSAuth`
-- `TOR_CONTROL_PASSWORD` set in the environment. The control password is **never**
-  stored in configuration files.
+- **Python**: `3.11+`
+- **Tooling**: [`uv`](https://docs.astral.sh/uv/) (All packaging, virtual-environment management, dependency locking, and execution are performed exclusively with `uv`. Never use bare `pip`, `python -m venv`, Poetry, or Pipenv.)
+- **Tor Daemon**: Reachable ControlPort (default `127.0.0.1:9051`) configured with `HashedControlPassword`, and SocksPort (default `127.0.0.1:9050`) with `IsolateSOCKSAuth`.
 
-## Install
+---
+
+## Setup with `uv`
 
 ```bash
-uv sync
+git clone https://github.com/jaskeerat01/torpool.git
+cd torpool
+
+# Create virtual environment and install locked dependencies reproducibly
+uv sync --frozen
 ```
 
-or, with plain pip:
+---
+
+## Configuring `TOR_CONTROL_PASSWORD`
+
+`torpool` supports Tor Control Port **password authentication only** (`CookieAuthentication` is rejected). The control password is **never** accepted on the command line and **never** stored in any configuration file. It must be supplied exclusively via the `TOR_CONTROL_PASSWORD` environment variable.
+
+1. Generate a hashed password for your `torrc`:
+   ```bash
+   tor --hash-password "your_strong_control_password"
+   ```
+2. Add the following to your `torrc` and reload Tor:
+   ```text
+   SocksPort 127.0.0.1:9050 IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth
+   ControlPort 127.0.0.1:9051
+   HashedControlPassword 16:YOUR_HASH_FROM_STEP_1
+   CookieAuthentication 0
+   ```
+3. Export `TOR_CONTROL_PASSWORD` in your shell before running `torpool`:
+   ```bash
+   # Prefix with a space if HISTCONTROL=ignorespace is enabled in your shell
+   export TOR_CONTROL_PASSWORD="your_strong_control_password"
+   ```
+
+If `TOR_CONTROL_PASSWORD` is unset, empty, or rejected by Tor, `torpool` exits immediately with a clear error and performs **zero network activity**.
+
+---
+
+## Example Commands
 
 ```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -e .
-pip install pytest pytest-asyncio
-```
-
-### Docker
-
-The image bundles its own Tor daemon and runs the app as an unprivileged user. The
-control password is hashed into a runtime-only `torrc`; it never appears in the image or
-config file.
-
-```bash
-export TOR_CONTROL_PASSWORD="your_secret_password"
-docker compose build
-
-# One-off command
-docker compose run --rm torpool doctor
-docker compose run --rm torpool fetch "http://example.onion/artifact.bin" --circuits 4 -v
-
-# Tests (offline)
-docker compose run --rm torpool pytest
-
-# Artifacts persist in ./quarantine
-```
-
-The compose service drops all capabilities, enables `no-new-privileges`, and mounts only
-the quarantine volume. The container waits for its internal Tor to reach 100% bootstrap
-before running the command.
-
-
-## Configure
-
-```bash
-cp config.example.toml ~/.config/torpool/config.toml
-export TOR_CONTROL_PASSWORD="your_secret_password"
+# 1. Confirm the authorization notice and initialize ~/.config/torpool/config.toml & ./quarantine
 uv run torpool init
-```
 
-`torpool init` prints the authorization notice, records your confirmation, and creates
-the quarantine and temporary directories with `0700` permissions.
-
-## Usage
-
-```bash
-# Verify control auth, bootstrap status, SOCKS listener, and permissions
+# 2. Run preflight diagnostics (checks Tor reachability, password auth, 100% bootstrap, SOCKS, and 0700 perms)
 uv run torpool doctor
 
-# Download a file across four circuits into quarantine
-uv run torpool fetch "http://example.onion/artifact.bin" --circuits 4 --chunk-size 10M
+# 3. Download a file across 4 Tor circuits with 10 MiB chunks, SHA-256 verification, and -v output
+uv run torpool fetch "http://example2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xy.onion/dataset.tar.zst" \
+  --circuits 4 \
+  --chunk-size 10M \
+  --out ./quarantine \
+  --sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 \
+  -v
 
-# Resume an interrupted download and verify a known digest
-uv run torpool fetch "http://example.onion/artifact.bin" --resume --sha256 <hex>
+# 4. Download with live terminal bandwidth graph, at-rest AES-256-GCM encryption, and 5 MiB/s rate cap
+uv run torpool fetch "https://example.org/published-research-dump.bin" \
+  --circuits 6 \
+  --chunk-size 8M \
+  --max-bandwidth 5M \
+  --per-host-concurrency 6 \
+  --encrypt \
+  --graph \
+  --log-file ./quarantine/operational.log \
+  -v
 
-# Rate-limit the pool to 5 MiB/s and show the live graph
-uv run torpool fetch "http://example.onion/artifact.bin" --max-bandwidth 5M --graph
+# 5. Resume an interrupted download from SQLite state without re-downloading finished chunks
+uv run torpool fetch "https://example.org/published-research-dump.bin" \
+  --out ./quarantine \
+  --resume \
+  -v
 
-# Inspect and rotate circuits
+# 6. Issue SIGNAL NEWNYM and rebuild all circuits before starting a job
+uv run torpool fetch "https://example.org/published-research-dump.bin" \
+  --new-identity \
+  -vv
+
+# 7. Inspect active Tor circuits, rotate a specific circuit, view status, or verify a file offline
+uv run torpool status --graph
 uv run torpool circuits list
-uv run torpool circuits rotate <circuit-id>
-
-# Verify a quarantined artifact
-uv run torpool verify ./quarantine/artifact.bin --sha256 <hex>
+uv run torpool circuits rotate 12
+uv run torpool verify ./quarantine/published-research-dump.bin --sha256 <EXPECTED_SHA256>
 ```
 
-Verbosity: `--quiet` (errors and final result), default (state changes and 10 s summaries),
-`-v` (build steps, chunk activity, health probes), `-vv` (scheduler/timing/stem debug).
-
-## Security model
-
-- Password-only Tor control authentication; cookie-only setups are rejected.
-- Refuses to start unless Tor reports `PROGRESS=100` and `status/circuit-established=1`.
-- `__LeaveStreamsUnattached 1` with deterministic stream attachment through each
-  circuit's dedicated local SOCKS listener; unknown streams are never silently attached
-  to the first circuit.
-- Exit-relay changes on a built circuit trigger a fail-closed pause.
-- Proxy environment variables are cleared before any network activity.
-- Downloads land in a `0700` quarantine directory; files are `0600`.
-- Cross-domain redirects are refused.
-
-See `SECURITY.md` for reporting vulnerabilities and the full threat model.
-
-## Tests
+### Running via Docker CLI (Optional)
 
 ```bash
-uv run pytest
+docker build -t torpool:latest .
+
+export TOR_CONTROL_PASSWORD="your_strong_control_password"
+mkdir -p ./quarantine && chmod 0700 ./quarantine
+
+docker run --rm -it \
+  -e TOR_CONTROL_PASSWORD \
+  -v "$(pwd)/quarantine:/quarantine" \
+  torpool:latest fetch "https://example.org/published-research-dump.bin" \
+  --circuits 4 --out /quarantine -v --graph
 ```
 
-Tests are offline: they exercise configuration, sanitization, metrics, state persistence,
-scheduling primitives, the per-circuit SOCKS listener and source-port mapping,
-verification, and rendering without contacting Tor.
+---
 
+## Sample Verbose Output
+
+All terminal output is written to `stderr` so `stdout` remains clean for scripting. Relay nicknames and short fingerprints appear on the terminal only and are never written to `--log-file`.
+
+### Default (Circuit state changes, replacements, and 10s summary lines)
+```text
+[CIRCUIT] id=circ_2 state=healthy->retiring reason=TIMEOUT healthy=3
+[REPLACE] old_id=circ_2 new_id=circ_5 reason=TIMEOUT reassigned_chunks=1 recovery_time=1.38s
+[SUMMARY] completed=41943040/104857600 B rate=1924.6 KiB/s healthy_circuits=4
+[COMPLETE] status=VERIFIED bytes=104857600 sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 duration=54.48s
+```
+
+### `-v` (Circuit build steps, chunk assignments/completions, health probes, and state saves)
+```text
+[BUILD_START] attempt=1 path=GuardAlpha[$9A1F22B0] -> MiddleRelay[$4C88E110] -> ExitNode[$77D019AA]
+[ACQUIRED] id=circ_1 attempt=1 path=GuardAlpha[$9A1F22B0] -> MiddleRelay[$4C88E110] -> ExitNode[$77D019AA] duration=0.81s reason=NONE healthy=4
+[CHUNK_ASSIGN] chunk=0 range=0-10485759 circuit=circ_1 retries=0
+[HEALTH] circuit=circ_1 status=OK latency=0.294s state=healthy
+[CHUNK_DONE] chunk=0 range=0-10485759 circuit=circ_1 tor_circ=14 rate=641.2 KiB/s retries=0
+[STATE] saved completed_chunks=1/10
+```
+
+### `-vv` (Debug timings, retry backoffs, scheduler decisions, and Stem lifecycle events)
+```text
+[DEBUG:STEM] circuit=14 status=BUILT reason=NONE
+[DEBUG:STEM] circuit=14 status=STREAM_SUCCEEDED reason=NONE
+[DEBUG:SCHED] decision=ADAPT_CHUNK_SPLIT detail=Split chunk 4 into 4 and 10 for slow circuit circ_3
+[DEBUG:TIMING] phase=chunk_0 elapsed=15.9672s
+```
+
+### `--quiet` (Errors and final result only)
+```text
+[COMPLETE] status=VERIFIED bytes=104857600 sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 duration=54.48s
+```
+
+---
+
+## Honesty Caveats & Technical Limitations
+
+Operators must account for the following realities when using `torpool` (see [`SECURITY.md`](./SECURITY.md) for the full threat model):
+
+1. **No Native Circuit Bonding**: Tor does not natively bond several circuits into a single network connection. `torpool` performs application-level HTTP byte-range splitting (`Range: bytes=start-end`) across independent circuits.
+2. **No Guaranteed Speed**: Application-level parallel downloads may improve throughput on high-latency circuits, but **cannot guarantee any particular speed**. Performance depends on circuit quality, relay congestion, exit relays, destination server limits, and scheduling.
+3. **No Guaranteed Unique Exit Relays**: Creating multiple logical circuits or `IsolateSOCKSAuth` sessions does not guarantee that every circuit uses a unique exit relay (or hidden-service rendezvous point).
+4. **Circuit Replacement Caveat**: Replacing a failed or degraded circuit does not guarantee that Tor will select a different exit relay.
+5. **No Absolute Anonymity**: Tor does not guarantee absolute anonymity. Operators remain vulnerable to endpoint compromise, timing correlation, and operational mistakes (such as leaking target URLs in shell history or terminal scrollback).
+6. **SHA-256 Integrity vs. Authenticity**: A locally calculated `SHA-256` hash does not prove that a file is authentic or benign; it only confirms that the bytes received match the expected hash when one is supplied. Downloaded files are never executed, unpacked, or parsed by `torpool` and are written strictly to `0700` quarantine storage.
+
+---
+
+## Security & OpSec Model
+
+- **Tor-Only Routing & Fail-Closed Startup**: Refuses to start if the Tor control port is unreachable, `TOR_CONTROL_PASSWORD` authentication fails, or Tor is not 100% bootstrapped (`PROGRESS=100`). Clears `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables and never falls back to a direct connection.
+- **Zero Local DNS Leaks**: Enforces `socks5h://` on every request so all hostname resolution occurs inside the Tor network, and refuses `localhost`/`127.0.0.1`/`::1` targets.
+- **Fingerprinting Defense**: Uses the fixed Tor Browser User-Agent (`Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0`), sends no custom headers or cookies, and refuses cross-domain redirects.
+- **Log & Manifest Sanitization**: Strips query tokens (`token`, `key`, `sig`, `auth`, `password`, `secret`), embedded credentials, local IPv4 addresses, OS usernames, relay fingerprints, and `TOR_CONTROL_PASSWORD` before writing logs or manifests. Temporary files are overwritten with random bytes (`shred_file`) before unlinking.
+
+---
+
+## Running the Test Suite
+
+All tests are executed via `uv run pytest`:
+
+```bash
+uv run pytest -v
+```
