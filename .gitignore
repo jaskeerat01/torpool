@@ -1,0 +1,55 @@
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments and uv state
+.venv/
+venv/
+env/
+.uv/
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+
+# TorPool runtime artifacts
+quarantine/
+tor-data/
+*.sqlite
+*.sqlite3
+*.db
+.torpool_state_*
+*.part
+*.tmp
+*.log
+*.enc
+
+# Secrets and local configuration (never commit control passwords)
+.env
+.env.*
+config.toml
+control-password
+*password*
+*.pem
+*.key
+*.crt
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

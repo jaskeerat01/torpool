@@ -1,0 +1,33 @@
+[project]
+name = "torpool"
+version = "0.1.0"
+description = "Multi-circuit Tor range-downloader for defensive threat-intelligence analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Systems Engineering" }]
+dependencies = [
+    "cryptography>=44.0.2",
+    "httpx[socks]>=0.28.1",
+    "rich>=14.0.0",
+    "stem>=1.8.2",
+    "typer>=0.15.2",
+]
+
+[project.scripts]
+torpool = "torpool.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.25.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

@@ -1,0 +1,70 @@
+# TorPool Configuration Example
+# SECURITY MANDATE: Never store the Tor control password in this file!
+# The control password MUST be supplied exclusively via the environment variable:
+# export TOR_CONTROL_PASSWORD="your_secret_password"
+
+[tor]
+# Number of parallel Tor circuits to maintain in the pool (min: 1, max: 16)
+circuits = 4
+
+# Tor Control Port (Password authentication required via TOR_CONTROL_PASSWORD)
+control_port = 9051
+
+# Base SOCKS5 port for Tor daemon. Each pooled circuit spawns its own dedicated
+# local SOCKS listener that bridges to socks_port_base with unique IsolateSOCKSAuth
+# credentials and maps its exact outbound TCP source port (SOURCE_ADDR) to its circuit ID.
+socks_port_base = 9050
+
+# Timeout in seconds for building a circuit or establishing a stream
+circuit_timeout = 30.0
+
+# Interval in seconds between active background health probes per circuit
+health_interval = 30.0
+
+# Target URL for health checks (must be lightweight and reachable over Tor)
+health_probe_url = "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/"
+
+[download]
+# Default byte-range chunk size in bytes (10 MiB = 10485760)
+chunk_size = 10485760
+
+# Maximum number of retries for an individual chunk before permanent failure
+max_retries_per_chunk = 5
+
+# Optional global bandwidth cap in bytes per second (0 = unlimited)
+max_bandwidth = 0
+
+# Maximum concurrent connections to the target host (0 = match healthy circuit count)
+per_host_concurrency = 0
+
+# Quarantine directory for downloaded files and manifests (created with 0700 perms)
+output_dir = "./quarantine"
+
+# Directory for temporary download files (shredded on clean exit)
+temp_dir = "./quarantine/tmp"
+
+# Encrypt downloaded files at rest using AES-256-GCM
+encrypt = false
+
+# Path to keyfile or passphrase file if encrypt = true
+key_file = ""
+
+[ui]
+# Verbosity level: -1 (quiet), 0 (default), 1 (-v), 2 (-vv / debug)
+verbosity = 0
+
+# Enable live terminal bandwidth graph (auto-disabled if stdout/stderr is not a TTY)
+graph = false
+
+# Graph refresh interval in seconds (clamped between 0.25 and 5.0)
+graph_refresh = 1.0
+
+# Rolling time window in seconds for the aggregate bandwidth chart
+graph_window = 120
+
+# Path to sanitized operational log file (optional)
+log_file = ""
+
+[auth]
+# Operator confirmation of authorization to access target data (set by `torpool init`)
+authorized_confirmed = false

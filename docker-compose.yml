@@ -1,0 +1,17 @@
+services:
+  torpool:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: torpool:latest
+    environment:
+      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:?Set TOR_CONTROL_PASSWORD in your shell}
+      - TORPOOL_ACCEPT_AUTH=${TORPOOL_ACCEPT_AUTH:-1}
+    volumes:
+      - ./quarantine:/quarantine
+    stdin_open: true
+    tty: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
