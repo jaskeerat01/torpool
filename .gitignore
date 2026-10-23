@@ -46,6 +46,10 @@ control-password
 *.key
 *.crt
 
+# Local design/spec notes (not published)
+argon_torpool.md
+torpool_argon.md
+
 # OS and editor files
 .DS_Store
 Thumbs.db
