@@ -4,17 +4,25 @@
 
 The default test suite is completely offline, fast, and does not require a running Tor daemon or internet access:
 
-- Configuration loading, validation, and recursive forbidden-key rejection.
-- Secret/URL/fingerprint log and manifest sanitization.
+- Configuration loading, validation, recursive forbidden-key rejection, the 1–100 circuit
+  boundary, and rejection of upload configuration keys.
+- Secret/URL/magnet/torrent/WebUI log and manifest sanitization.
 - Bounded event bus and sanitized log writer.
 - Rolling throughput metrics, control-port `CIRC_BW` counters, and rate-limiter token bucket logic.
+- Circuit-build throttling, NEWNYM limiting, injected clocks, and 100-circuit behavior.
+- qBittorrent preference construction, mandatory read-back, proxy verification, and
+  zero-upload enforcement.
+- Multi-file torrent sharding, single-file single-circuit fallback, aggregate bandwidth,
+  torrent resume state, path-traversal rejection, and streaming encryption.
 - Per-circuit SOCKS listener forwarding, TCP source-port correlation, and graceful listener teardown.
 - Circuit-pool slot lifecycle with dedicated loopback SOCKS listeners.
-- SQLite chunk state, resume, and dynamic split persistence.
+- SQLite chunk state, torrent state, resume, and dynamic split persistence.
 - Pre-download disk space verification (`shutil.disk_usage`) and ENOSPC fail-closed handling.
 - Cross-domain redirect fail-closed rejection with clear destination URL guidance.
 - Ciphertext-only encryption model (`EncryptedFileSession`), authenticated record index (`.idx`), and `torpool decrypt` recovery with `0600` permissions.
 - Dashboard sparkline/chart rendering and terminal fallbacks.
+- Static Docker checks for multi-stage builds, internal sidecar networking, secret handling,
+  and absence of published ports.
 
 Run the default offline suite:
 
@@ -38,6 +46,10 @@ TorPool includes an optional integration testing harness for end-to-end verifica
   Located in `tests/integration/file_generator.py`. Creates deterministic pseudo-random binary test files of arbitrary size with SHA-256 digest calculation.
 - **Tor Environment Harness (`tor_harness.py`)**:
   Located in `tests/integration/tor_harness.py`. Provides helpers for pointing integration tests to an ephemeral local Tor daemon, system Tor instance, or Chutney network via environment variables (`TOR_CONTROL_PORT`, `TOR_SOCKS_PORT`, `TOR_CONTROL_PASSWORD`, `CHUTNEY_PATH`).
+- **Optional real qBittorrent check**:
+  The integration suite starts a real local qBittorrent process when one is installed,
+  applies the conservative proxy/upload preferences, and verifies the full read-back.
+  Set `TORPOOL_QBITTORRENT` to choose a binary.
 
 ### Running the Integration Suite
 

@@ -42,11 +42,12 @@ from torpool.sanitizer import (
 from torpool.scheduler import ChunkScheduler
 from torpool.state_store import ChunkRecord, StateStore
 from torpool.tor_controller import CircuitSocksListener, RelayInfo, TorController, TorError
+from torpool.tor_password import hash_control_password
 from torpool.verifier import EncryptedFileSession, IntegrityVerifier, VerificationError
 
 
 def test_version() -> None:
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.2.0"
 
 
 # --------------------------------------------------------------------------- config
@@ -64,7 +65,7 @@ def test_config_defaults_are_valid() -> None:
     "kwargs",
     [
         {"circuits": 0},
-        {"circuits": 17},
+        {"circuits": 101},
         {"chunk_size": 1024},
         {"health_interval": 0.5},
         {"circuit_timeout": 0.5},
@@ -86,12 +87,18 @@ def test_config_loads_sections_and_paths(tmp_path: Path) -> None:
         """
 [tor]
 circuits = 3
+circuit_creation_delay = 2.0
 control_port = 9151
 
 [download]
 chunk_size = 1048576
 output_dir = "/tmp/torpool-out"
 encrypt = true
+
+[torrent]
+torrent_mode = "multi_file"
+torrent_max_instances = 4
+qbittorrent_executable = "qbittorrent-nox"
 
 [ui]
 verbosity = 1
@@ -101,10 +108,13 @@ graph = false
     )
     cfg = ConfigLoader.load(config_path=config_file)
     assert cfg.circuits == 3
+    assert cfg.circuit_creation_delay == 2.0
     assert cfg.control_port == 9151
     assert cfg.chunk_size == 1048576
     assert cfg.output_dir == Path("/tmp/torpool-out")
     assert cfg.encrypt is True
+    assert cfg.torrent_mode == "multi_file"
+    assert cfg.torrent_max_instances == 4
     assert cfg.verbosity == 1
 
 
@@ -119,11 +129,31 @@ def test_control_password_only_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("TOR_CONTROL_PASSWORD", raising=False)
+    monkeypatch.delenv("TOR_CONTROL_PASSWORD_FILE", raising=False)
     with pytest.raises(ConfigError, match="TOR_CONTROL_PASSWORD"):
         TorPoolConfig.get_control_password()
 
     monkeypatch.setenv("TOR_CONTROL_PASSWORD", "s3cret")
     assert TorPoolConfig.get_control_password() == "s3cret"
+
+
+def test_control_password_docker_secret_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = tmp_path / "secret"
+    secret.write_text("file-secret\n", encoding="utf-8")
+    monkeypatch.delenv("TOR_CONTROL_PASSWORD", raising=False)
+    monkeypatch.setenv("TOR_CONTROL_PASSWORD_FILE", str(secret))
+    assert TorPoolConfig.get_control_password() == "file-secret"
+
+
+def test_hash_control_password_matches_tor_vector() -> None:
+    value = hash_control_password(
+        "test-password",
+        salt=bytes.fromhex("32DE60A413A71519"),
+        iteration=0x60,
+    )
+    assert value == "16:32DE60A413A7151960A7FA9AE38191394D10B0026F86366BD729DFE182"
 
 
 def test_save_authorization_sets_flag_and_permissions(tmp_path: Path) -> None:
@@ -156,16 +186,22 @@ def test_sanitize_log_text_redacts_secrets(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("USER", "jaskeerat")
     raw = (
         "pw=super-secret-pw url=https://abc.onion/x?token=1 "
+        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=https://tracker.example/passkey "
+        "path=/home/jaskeerat/file.torrent "
         "fp=$ABCDEF0123456789ABCDEF0123456789ABCDEF01 "
-        "ip=192.168.1.10 path=/home/jaskeerat/file token=zzz"
+        "ip=192.168.1.10 path=/home/jaskeerat/file token=zzz "
+        "qbt_password=leaked"
     )
     clean = sanitize_log_text(raw)
     assert "super-secret-pw" not in clean
     assert "https://abc.onion" not in clean
+    assert "tracker.example" not in clean
+    assert "file.torrent" not in clean
     assert "ABCDEF0123456789" not in clean
     assert "192.168.1.10" not in clean
     assert "/jaskeerat/" not in clean
     assert "zzz" not in clean
+    assert "leaked" not in clean
 
 
 def test_clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1040,3 +1076,36 @@ def test_live_status_reporting_and_cli(tmp_path: Path) -> None:
     assert "https://example.onion/secure_file.iso" in result.output
     assert "slot-0" in result.output
     assert "tor-99" in result.output
+
+
+def test_healthcheck_cli_without_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOR_CONTROL_PASSWORD", "test")
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(f'[download]\noutput_dir = "{tmp_path / "q"}"\n', encoding="utf-8")
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_conn)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+    monkeypatch.setattr("torpool.cli.socket.create_connection", lambda *a, **k: fake_conn)
+    monkeypatch.setattr(TorController, "connect_and_verify", lambda self: None)
+    monkeypatch.setattr(TorController, "close", lambda self: None)
+    result = CliRunner().invoke(app, ["healthcheck", "--config", str(config_file)])
+    assert result.exit_code == 0
+    assert "HEALTHCHECK OK" in result.output
+
+
+def test_doctor_skip_torrent_with_mocked_tor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOR_CONTROL_PASSWORD", "test")
+    config_file = tmp_path / "config.toml"
+    output = tmp_path / "quarantine"
+    config_file.write_text(f'[download]\noutput_dir = "{output}"\n', encoding="utf-8")
+    fake_conn = MagicMock()
+    fake_conn.__enter__ = MagicMock(return_value=fake_conn)
+    fake_conn.__exit__ = MagicMock(return_value=False)
+    monkeypatch.setattr("torpool.cli.socket.create_connection", lambda *a, **k: fake_conn)
+    monkeypatch.setattr(TorController, "connect_and_verify", lambda self: None)
+    monkeypatch.setattr(TorController, "close", lambda self: None)
+    result = CliRunner().invoke(app, ["doctor", "--config", str(config_file), "--skip-torrent"])
+    assert result.exit_code == 0
+    assert "DOCTOR OK" in result.output

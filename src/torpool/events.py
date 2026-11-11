@@ -21,6 +21,16 @@ class EventType(str, Enum):
     CIRCUIT_FAILED = "CIRCUIT_FAILED"
     CIRCUIT_REPLACED = "CIRCUIT_REPLACED"
     CIRCUIT_STATE_CHANGE = "CIRCUIT_STATE_CHANGE"
+    CIRCUIT_CREATION_THROTTLED = "CIRCUIT_CREATION_THROTTLED"
+    CIRCUIT_ASSIGNED_TO_TORRENT = "CIRCUIT_ASSIGNED_TO_TORRENT"
+    TORRENT_ADDED = "TORRENT_ADDED"
+    TORRENT_METADATA_RECEIVED = "TORRENT_METADATA_RECEIVED"
+    TORRENT_PIECE_DONE = "TORRENT_PIECE_DONE"
+    TORRENT_FILE_DONE = "TORRENT_FILE_DONE"
+    TORRENT_FINISHED = "TORRENT_FINISHED"
+    TORRENT_ERROR = "TORRENT_ERROR"
+    QBITTORRENT_STARTED = "QBITTORRENT_STARTED"
+    QBITTORRENT_STOPPED = "QBITTORRENT_STOPPED"
     CHUNK_ASSIGNED = "CHUNK_ASSIGNED"
     CHUNK_DONE = "CHUNK_DONE"
     CHUNK_RETRY = "CHUNK_RETRY"
@@ -167,6 +177,18 @@ class SanitizedLogWriter:
             "backoff_s",
             "completed_bytes",
             "total_bytes",
+            "instance_id",
+            "file_index",
+            "files_done",
+            "files_total",
+            "infohash_prefix",
+            "piece_index",
+            "piece_count",
+            "pieces_delta",
+            "dlspeed",
+            "delay_s",
+            "wait_s",
+            "next_in_s",
         ):
             if allowed_key in d:
                 val = d[allowed_key]
@@ -223,6 +245,45 @@ class TerminalVerboseRenderer:
                 f"reason={d.get('reason')} reassigned_chunks={d.get('reassigned_chunks', 0)} "
                 f"recovery_time={d.get('recovery_s', 0.0):.2f}s"
             )
+        if et == EventType.CIRCUIT_CREATION_THROTTLED:
+            return (
+                f"[THROTTLE] reason={d.get('reason')} wait={d.get('wait_s', 0.0):.2f}s "
+                f"delay={d.get('delay_s', 0.0):.2f}s"
+            )
+        if et == EventType.CIRCUIT_ASSIGNED_TO_TORRENT:
+            return (
+                f"[TORRENT-CIRCUIT] instance={d.get('instance_id')} "
+                f"circuit={d.get('circuit_id')} role={d.get('role', 'download')}"
+            )
+        if et == EventType.QBITTORRENT_STARTED:
+            return (
+                f"[QBIT] started instance={d.get('instance_id')} "
+                f"version={d.get('version', 'unknown')}"
+            )
+        if et == EventType.QBITTORRENT_STOPPED:
+            return f"[QBIT] stopped instance={d.get('instance_id')} status={d.get('status')}"
+        if et == EventType.TORRENT_ADDED:
+            return (
+                f"[TORRENT] added instance={d.get('instance_id')} "
+                f"infohash={d.get('infohash_prefix')} files={d.get('files_total')}"
+            )
+        if et == EventType.TORRENT_METADATA_RECEIVED:
+            return (
+                f"[TORRENT] metadata infohash={d.get('infohash_prefix')} "
+                f"files={d.get('files_total')} bytes={d.get('total_bytes')}"
+            )
+        if et == EventType.TORRENT_FILE_DONE:
+            return (
+                f"[TORRENT-FILE] instance={d.get('instance_id')} "
+                f"file={d.get('file_index')} files_done={d.get('files_done')}/{d.get('files_total')}"
+            )
+        if et == EventType.TORRENT_FINISHED:
+            return (
+                f"[TORRENT-DONE] files={d.get('files_total')} bytes={d.get('total_bytes')} "
+                f"duration={d.get('duration_s', 0.0):.2f}s"
+            )
+        if et == EventType.TORRENT_ERROR:
+            return f"[TORRENT-ERROR] reason={d.get('reason')} message={d.get('message')}"
         if et == EventType.SUMMARY_TICK:
             return (
                 f"[SUMMARY] completed={d.get('completed_bytes', 0)}/{d.get('total_bytes', 0)} B "
@@ -292,6 +353,11 @@ class TerminalVerboseRenderer:
             return None
 
         # Level 2 (-vv) debug events
+        if et == EventType.TORRENT_PIECE_DONE:
+            return (
+                f"[TORRENT-PIECE] instance={d.get('instance_id')} "
+                f"pieces_delta={d.get('pieces_delta')} total={d.get('piece_count')}"
+            )
         if et == EventType.DEBUG_TIMING:
             return f"[DEBUG:TIMING] phase={d.get('phase')} elapsed={d.get('duration_s', 0.0):.4f}s"
         if et == EventType.DEBUG_SCHEDULER:

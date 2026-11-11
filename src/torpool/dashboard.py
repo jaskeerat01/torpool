@@ -145,8 +145,13 @@ class Dashboard:
 
         header_summary = (
             f"Current: {curr_kib:.1f} KiB/s | Peak: {peak_kib:.1f} KiB/s | "
-            f"Avg: {avg_kib:.1f} KiB/s | Completed: {completed}/{total} B ({pct:.1f}%) | ETA: {eta_str}\n\n"
-            f"Aggregate Bandwidth ({self.config.graph_window}s window):\n{chart_str}"
+            f"Avg: {avg_kib:.1f} KiB/s | Completed: {completed}/{total} B ({pct:.1f}%) | ETA: {eta_str}"
+        )
+        items_total = int(snap.get("items_total", 0))
+        if items_total > 0:
+            header_summary += f" | Files: {int(snap.get('items_done', 0))}/{items_total}"
+        header_summary += (
+            f"\n\nAggregate Bandwidth ({self.config.graph_window}s window):\n{chart_str}"
         )
 
         grid = Table.grid(expand=True)

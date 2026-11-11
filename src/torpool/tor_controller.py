@@ -186,10 +186,17 @@ class TorController:
         config: TorPoolConfig,
         event_bus: EventBus,
         metrics: Optional[MetricsWindow] = None,
+        newnym_interval: float = 10.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self.event_bus = event_bus
         self.metrics = metrics
+        self.newnym_interval = newnym_interval
+        self._clock = clock
+        self._sleep = sleep
+        self._last_newnym_at: Optional[float] = None
         self._controller: Optional[Controller] = None
         self._lock = threading.Lock()
 
@@ -260,10 +267,12 @@ class TorController:
         password = self.config.get_control_password()
 
         try:
-            ctrl = Controller.from_port(address="127.0.0.1", port=self.config.control_port)
+            ctrl = Controller.from_port(
+                address=self.config.tor_control_host, port=self.config.control_port
+            )
         except Exception as exc:
             raise TorError(
-                f"Unable to reach Tor control port {self.config.control_port}: {exc}"
+                f"Unable to reach Tor control port {self.config.tor_control_host}:{self.config.control_port}: {exc}"
             ) from exc
 
         try:
@@ -328,10 +337,22 @@ class TorController:
             self._controller = None
 
     def new_identity(self) -> None:
-        """Issue SIGNAL NEWNYM and clear used guard/middle sets."""
+        """Issue SIGNAL NEWNYM with a mandatory 10-second minimum interval."""
         if not self._controller:
             raise TorError("Controller not connected.")
+        now = self._clock()
+        if self._last_newnym_at is not None:
+            wait_s = max(0.0, self.newnym_interval - (now - self._last_newnym_at))
+            if wait_s > 0.0:
+                self.event_bus.emit(
+                    EventType.CIRCUIT_CREATION_THROTTLED,
+                    reason="NEWNYM",
+                    wait_s=wait_s,
+                    delay_s=self.newnym_interval,
+                )
+                self._sleep(wait_s)
         self._controller.signal(Signal.NEWNYM)
+        self._last_newnym_at = self._clock()
         with self._lock:
             self._used_guards.clear()
             self._used_middles.clear()

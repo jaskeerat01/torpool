@@ -1,17 +1,91 @@
 services:
-  torpool:
+  tor:
     build:
-      context: .
+      context: ./docker/tor
       dockerfile: Dockerfile
-    image: torpool:latest
+    image: torpool-tor:latest
     environment:
-      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:?Set TOR_CONTROL_PASSWORD in your shell}
-      - TORPOOL_ACCEPT_AUTH=${TORPOOL_ACCEPT_AUTH:-1}
-    volumes:
-      - ./quarantine:/quarantine
-    stdin_open: true
-    tty: true
+      TOR_CONTROL_PASSWORD_FILE: /run/secrets/tor_control_password
+    secrets:
+      - tor_control_password
+    networks:
+      torpool-internal:
+        ipv4_address: 172.30.0.2
+      tor-egress: {}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=0700
+      - /var/lib/tor:size=256m,mode=0700
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/172.30.0.2/9051' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  torpool:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: torpool:0.2.0
+    depends_on:
+      tor:
+        condition: service_healthy
+    environment:
+      TORPOOL_TOR_MODE: external
+      TOR_SOCKS_HOST: tor
+      TOR_CONTROL_HOST: tor
+      TORPOOL_ACCEPT_AUTH: "1"
+      TORPOOL_OUTPUT_DIR: /quarantine
+      TORPOOL_TEMP_DIR: /quarantine/tmp
+      TORPOOL_STATE_DIR: /state
+      TORPOOL_LOG_FILE: /logs/torpool.log
+      TORPOOL_QBITTORRENT_TEMP_PROFILE_DIR: /tmp/torpool-qbt
+      TOR_CONTROL_PASSWORD_FILE: /run/secrets/tor_control_password
+    secrets:
+      - tor_control_password
+    networks:
+      - torpool-internal
+    volumes:
+      - ./quarantine:/quarantine
+      - ./state:/state
+      - ./logs:/logs
+      - ./config:/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    init: true
+    stop_grace_period: 45s
+    stdin_open: true
+    tty: true
+    healthcheck:
+      test: ["CMD", "torpool", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+secrets:
+  tor_control_password:
+    file: ./secrets/tor_control_password
+
+networks:
+  torpool-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  tor-egress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

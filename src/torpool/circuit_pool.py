@@ -9,6 +9,7 @@ from typing import Optional
 from torpool.config import TorPoolConfig
 from torpool.events import EventBus, EventType
 from torpool.metrics import MetricsWindow
+from torpool.throttle import CircuitBuildThrottle
 from torpool.tor_controller import CircuitSocksListener, RelayInfo, TorController, TorError
 
 
@@ -66,11 +67,13 @@ class CircuitPool:
         controller: TorController,
         event_bus: EventBus,
         metrics: MetricsWindow,
+        throttle: Optional[CircuitBuildThrottle] = None,
     ) -> None:
         self.config = config
         self.controller = controller
         self.event_bus = event_bus
         self.metrics = metrics
+        self.throttle = throttle or CircuitBuildThrottle(config.circuit_creation_delay, event_bus)
         self._circuits: dict[str, ManagedCircuit] = {}
         self._lock = asyncio.Lock()
         self._unavailable_slots: int = 0
@@ -99,16 +102,19 @@ class CircuitPool:
     def healthy_count(self) -> int:
         return sum(1 for c in self._circuits.values() if c.state == CircuitState.HEALTHY)
 
-    async def initialize_pool(self) -> None:
-        """Build N initial circuits for the download job."""
-        tasks = [self._build_slot() for _ in range(self.config.circuits)]
-        await asyncio.gather(*tasks)
+    async def initialize_pool(self, count: Optional[int] = None) -> None:
+        """Build the requested number of circuits sequentially with mandatory throttling."""
+        target = count if count is not None else self.config.circuits
+        target = max(1, min(target, self.config.circuits, 100))
+        for _ in range(target):
+            await self._build_slot()
         if self.healthy_count() == 0:
             raise TorError("Failed to build any healthy Tor circuits. Aborting.")
 
     async def _build_slot(self, failed_at: Optional[float] = None) -> Optional[ManagedCircuit]:
-        """Attempt to build a single circuit and start its dedicated SOCKS listener (up to 3 retries)."""
+        """Build one circuit with throttle enforcement, retries, and exponential back-off."""
         for attempt in range(1, 4):
+            await self.throttle.wait(reason=f"CIRCUIT_BUILD_ATTEMPT_{attempt}")
             try:
                 cid, path, duration, s_user, s_pass = await asyncio.to_thread(
                     self.controller.build_circuit, attempt
@@ -116,7 +122,7 @@ class CircuitPool:
                 listener = CircuitSocksListener(
                     circuit_id=cid,
                     socks_user=s_user,
-                    tor_socks_host="127.0.0.1",
+                    tor_socks_host=self.config.tor_socks_host,
                     tor_socks_port=self.config.socks_port_base,
                     controller=self.controller,
                 )
@@ -163,13 +169,21 @@ class CircuitPool:
                     reason=str(exc),
                     healthy_count=h_count,
                 )
-                await asyncio.sleep(0.2 * attempt)
+                if attempt < 3:
+                    backoff = min(30.0, 0.5 * (2 ** (attempt - 1)))
+                    self.event_bus.emit(
+                        EventType.CIRCUIT_CREATION_THROTTLED,
+                        reason="BUILD_BACKOFF",
+                        wait_s=backoff,
+                        delay_s=self.config.circuit_creation_delay,
+                    )
+                    await asyncio.sleep(backoff)
 
         async with self._lock:
             self._unavailable_slots += 1
         self.event_bus.emit(
             EventType.ERROR,
-            message="Circuit slot marked unavailable after 3 build timeouts",
+            message="Circuit slot marked unavailable after 3 build failures",
             reason="BUILD_TIMEOUT_EXHAUSTED",
         )
         return None

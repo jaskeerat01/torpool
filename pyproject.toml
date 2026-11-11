@@ -1,33 +1,33 @@
 [project]
 name = "torpool"
-version = "0.1.0"
-description = "Multi-circuit Tor range-downloader for defensive threat-intelligence analysis"
+version = "0.2.0"
+description = "Multi-circuit Tor HTTP and BitTorrent downloader for defensive threat-intelligence analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Systems Engineering" }]
 dependencies = [
-    "cryptography>=44.0.2",
+    "cryptography>=50.0.2",
     "httpx[socks]>=0.28.1",
-    "rich>=14.0.0",
+    "rich>=15.0.0",
     "stem>=1.8.2",
-    "typer>=0.15.2",
+    "typer>=0.29.0",
 ]
 
 [project.scripts]
 torpool = "torpool.cli:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "hatchling>=1.32.4",
-    "mypy>=2.4.0",
-    "pytest>=8.3.5",
-    "pytest-asyncio>=0.25.3",
-    "ruff>=0.17.2",
+    "hatchling>=1.33.0",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1",
+    "ruff>=0.17.4",
 ]
 
 [tool.pytest.ini_options]

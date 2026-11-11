@@ -146,3 +146,57 @@ async def test_integration_range_download_and_resume(tmp_path: Path) -> None:
     finally:
         server.stop()
         state_store.remove()
+
+
+@pytest.mark.asyncio
+async def test_integration_real_qbittorrent_preferences(tmp_path: Path) -> None:
+    """Optionally verify a real qBittorrent process accepts OPSEC preferences."""
+    import os
+
+    from torpool.config import TorPoolConfig
+    from torpool.qbittorrent import (
+        PreferenceExpectation,
+        QBittorrentProcess,
+        build_torrent_preferences,
+        qbittorrent_location,
+    )
+
+    executable = qbittorrent_location(
+        os.environ.get("TORPOOL_QBITTORRENT", "qbittorrent-nox")
+    ) or qbittorrent_location("qbittorrent")
+    if not executable:
+        pytest.skip("qBittorrent is not installed for the optional integration test")
+
+    cfg = TorPoolConfig(
+        output_dir=tmp_path / "quarantine",
+        temp_dir=tmp_path / "quarantine" / "tmp",
+        qbittorrent_temp_profile_dir=tmp_path / "profiles",
+    )
+    cfg.output_dir.mkdir(parents=True)
+    cfg.temp_dir.mkdir(parents=True)
+    cfg.qbittorrent_temp_profile_dir.mkdir(parents=True)
+    process = QBittorrentProcess.create(executable, cfg.qbittorrent_temp_profile_dir / "1")
+    client = await process.start()
+    try:
+        expected = PreferenceExpectation(
+            proxy_port=9,
+            proxy_username="tp_integration",
+            save_path=str(cfg.temp_dir),
+            listen_port=process.torrent_port,
+            bind_interface="lo",
+            web_port=process.web_port,
+        )
+        prefs = build_torrent_preferences(
+            cfg,
+            "tp_integration",
+            "secret",
+            9,
+            cfg.temp_dir,
+            process.torrent_port,
+            process.web_port,
+            0,
+        )
+        await client.apply_and_verify(prefs, expected)
+    finally:
+        await client.close()
+        await process.stop()

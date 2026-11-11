@@ -4,16 +4,22 @@
 # export TOR_CONTROL_PASSWORD="your_secret_password"
 
 [tor]
-# Number of parallel Tor circuits to maintain in the pool (min: 1, max: 16)
+# Number of parallel Tor circuits to maintain in the pool (min: 1, max: 100)
 circuits = 4
 
-# Tor Control Port (Password authentication required via TOR_CONTROL_PASSWORD)
-control_port = 9051
+# Mandatory minimum delay between circuit-build requests (min: 0.5 seconds).
+# This cannot be disabled. Building 100 circuits therefore takes at least ~100s.
+circuit_creation_delay = 1.0
 
-# Base SOCKS5 port for Tor daemon. Each pooled circuit spawns its own dedicated
-# local SOCKS listener that bridges to socks_port_base with unique IsolateSOCKSAuth
-# credentials and maps its exact outbound TCP source port (SOURCE_ADDR) to its circuit ID.
+# Tor Control Port (password authentication via TOR_CONTROL_PASSWORD)
+control_port = 9051
+tor_control_host = "127.0.0.1"
+
+# Base SOCKS5 port for the Tor daemon. Each pooled circuit spawns its own dedicated
+# local SOCKS listener that bridges to this endpoint and maps its exact outbound TCP
+# source port (SOURCE_ADDR) to its circuit ID.
 socks_port_base = 9050
+tor_socks_host = "127.0.0.1"
 
 # Timeout in seconds for building a circuit or establishing a stream
 circuit_timeout = 30.0
@@ -43,11 +49,53 @@ output_dir = "./quarantine"
 # Directory for temporary download files (shredded on clean exit)
 temp_dir = "./quarantine/tmp"
 
+# Optional separate state directory for resume/status SQLite files.
+# Leave empty/omitted to keep state inside output_dir.
+# state_dir = "./state"
+
 # Encrypt downloaded files at rest using AES-256-GCM
 encrypt = false
 
 # Path to keyfile or passphrase file if encrypt = true
 key_file = ""
+
+[torrent]
+# qBittorrent executable. "qbittorrent-nox" is recommended for headless use.
+qbittorrent_executable = "qbittorrent-nox"
+
+# Preferred Web UI port (0 = allocate a fresh loopback port per instance).
+qbittorrent_web_port = 0
+
+# Temporary per-job qBittorrent profiles are created here and securely removed.
+qbittorrent_temp_profile_dir = "./quarantine/tmp/qbt"
+
+# auto = shard multi-file torrents across circuits and use one circuit for a single file.
+# multi_file = force file sharding (falls back to one circuit for single-file torrents).
+# single = always use exactly one circuit and one qBittorrent instance.
+torrent_mode = "auto"
+
+# Maximum simultaneous qBittorrent instances (also capped by circuits and file count).
+torrent_max_instances = 8
+
+# Per-instance maximum peer connections.
+torrent_max_connections = 100
+
+# DHT and LSD use UDP and cannot traverse Tor. Enabling either is rejected.
+dht_enabled = false
+lsd_enabled = false
+
+# PEX is TCP and can traverse Tor, but is disabled by default to reduce linkability.
+pex_enabled = false
+
+# Bind qBittorrent's listening/outgoing interface to loopback. All peer traffic must
+# use the circuit's SOCKS listener; this prevents direct clearnet interface use.
+torrent_bind_interface = "lo"
+
+# Timeout for magnet metadata acquisition over Tor.
+torrent_metadata_timeout = 120.0
+
+# Progress polling interval in seconds.
+torrent_poll_interval = 1.0
 
 [ui]
 # Verbosity level: -1 (quiet), 0 (default), 1 (-v), 2 (-vv / debug)

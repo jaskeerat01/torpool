@@ -41,6 +41,9 @@ tor-data/
 .env.*
 config.toml
 control-password
+secrets/
+state/
+logs/
 *password*
 *.pem
 *.key

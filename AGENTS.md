@@ -43,11 +43,20 @@ uv run torpool decrypt ./quarantine/file.enc --out ./recovered.file [--key-file 
 
 - `config.py` — TOML + CLI overrides. Relative `output_dir`/`temp_dir` resolve against the
   **current working directory**, not the config file. Recursively rejects TOML keys named
-  `password`, `control_password`, `tor_control_password`, or `cookie`. Validates `--key-file`
-  for non-empty passphrase.
+  `password`, `control_password`, `tor_control_password`, `cookie`, or `torrent_max_uploads`.
+  Validates `--key-file` for non-empty passphrase. Circuit bounds are 1–100; the
+  circuit-creation delay is non-disableable (minimum 0.5s).
 - `tor_controller.py` — stem wrapper: password auth, `EXTENDCIRCUIT`, `__LeaveStreamsUnattached 1`,
-  per-circuit `CircuitSocksListener`, `SOURCE_ADDR` source-port mapping, `CIRC_BW` metrics.
-- `circuit_pool.py` — slot lifecycle, health replacement, listener teardown.
+  per-circuit `CircuitSocksListener`, `SOURCE_ADDR` source-port mapping, `CIRC_BW` metrics,
+  configurable control/SOCKS hosts, and NEWNYM rate limiting.
+- `throttle.py`/`circuit_pool.py` — sequential, throttled circuit builds, exponential
+  back-off, slot lifecycle, health replacement, listener teardown.
+- `qbittorrent.py` — loopback-only official Web API client, temporary profile/process
+  supervision, conservative preference application, mandatory read-back, and upload
+  prohibition checks.
+- `torrent_manager.py` — magnet/.torrent parsing, multi-file sharding, single-file
+  single-circuit fallback, circuit rebinding, aggregate metrics, resume, finalization,
+  immediate torrent removal, and clean shutdown.
 - `scheduler.py` — work-stealing workers, adaptive chunk splitting for slow circuits, retries,
   pre-download disk space checks via `shutil.disk_usage`, fail-closed pause, and periodic atomic
   live status emission (`.torpool_status_<id>.json`).
@@ -81,6 +90,15 @@ uv run torpool decrypt ./quarantine/file.enc --out ./recovered.file [--key-file 
 - Cross-domain redirects are refused during probing; the error instructs the operator to supply
   the final destination URL directly.
 - `--key-file` is fully implemented: requires an existing, non-empty file with the passphrase.
+- Circuit creation is strictly sequential and rate-limited. Do not parallelize builds or
+  make the delay optional. NEWNYM has a 10 s minimum interval.
+- Torrent downloads use one isolated qBittorrent instance per circuit. Multi-file torrents
+  are sharded by file priority; single-file torrents use one circuit. Uploading and
+  seeding are prohibited and any uploaded payload byte must abort the job.
+- qBittorrent must be bound to loopback, use SOCKS5 with hostname lookup and proxied peer
+  connections, and disable DHT/LSD/UPnP. Preferences are read back and any mismatch fails closed.
+- The Docker default is a Tor sidecar on an internal network. The torpool container must not
+  have a clearnet route. Embedded Tor is a secondary mode.
 - In encrypted downloads (`--encrypt`), only ciphertext and authenticated index exist on disk.
   No plaintext `.part` files are ever written. Decrypt with `torpool decrypt`.
 - `manifest.json` reports `"status": "VERIFIED"` whenever hashing succeeds; it only compares
@@ -93,7 +111,8 @@ uv run torpool decrypt ./quarantine/file.enc --out ./recovered.file [--key-file 
 
 ## Security invariants
 
-- Control password comes only from `TOR_CONTROL_PASSWORD`; never add it to TOML, logs, or argv.
+- Control password comes only from `TOR_CONTROL_PASSWORD` or a Docker secret exposed as
+  `TOR_CONTROL_PASSWORD_FILE`; never add it to TOML, logs, or argv.
 - Always clear proxy environment variables and use `trust_env=False`; SOCKS URLs use
   `socks5h://` so DNS happens inside Tor.
 - Do not log secrets, fingerprints, full URLs, or local addresses; route output through the

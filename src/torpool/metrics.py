@@ -34,12 +34,20 @@ class MetricsWindow:
         self._peak_aggregate_bps: float = 0.0
         self._total_bytes_completed: int = 0
         self._total_bytes_target: int = 0
+        self._items_done: int = 0
+        self._items_total: int = 0
 
     def set_target_size(self, total_bytes: int, initial_completed: int = 0) -> None:
         """Initialize target file size and resumed byte count."""
         with self._lock:
             self._total_bytes_target = total_bytes
             self._total_bytes_completed = initial_completed
+
+    def set_job_items(self, done: int, total: int) -> None:
+        """Set a coarse item counter (e.g. torrent files) for the dashboard."""
+        with self._lock:
+            self._items_done = max(0, done)
+            self._items_total = max(0, total)
 
     def record_bytes(self, circuit_id: str, num_bytes: int, now: Optional[float] = None) -> None:
         """Record transferred bytes for a specific circuit."""
@@ -139,6 +147,8 @@ class MetricsWindow:
                 "eta_s": eta_s,
                 "aggregate_history": hist,
                 "circuit_histories": circuit_snaps,
+                "items_done": self._items_done,
+                "items_total": self._items_total,
             }
 
 

@@ -154,6 +154,22 @@ class IntegrityVerifier:
         return hasher.hexdigest()
 
     @staticmethod
+    def compute_tree_sha256(entries: list[tuple[str, str]]) -> str:
+        """
+        Compute a deterministic digest over (relative_path, file_sha256) pairs.
+
+        Entries are sorted by relative path; each line is
+        ``path\\0sha256\\n`` encoded as UTF-8.
+        """
+        hasher = hashlib.sha256()
+        for relative_path, digest in sorted(entries, key=lambda item: item[0]):
+            hasher.update(relative_path.encode("utf-8"))
+            hasher.update(b"\0")
+            hasher.update(digest.lower().encode("ascii"))
+            hasher.update(b"\n")
+        return hasher.hexdigest()
+
+    @staticmethod
     def shred_file(file_path: Path) -> None:
         """Overwrite file with random bytes, flush, and unlink."""
         if not file_path.exists() or not file_path.is_file():
@@ -187,10 +203,11 @@ class IntegrityVerifier:
         encrypt: bool = False,
         passphrase: Optional[str] = None,
         actual_sha256_override: Optional[str] = None,
+        manifest_id: Optional[str] = None,
     ) -> tuple[bool, str, Path]:
         """
         Verify file against expected_sha256, handle encryption if requested,
-        and append sanitized manifest entry.
+        and append a sanitized manifest entry using an opaque content ID.
         Returns (passed, actual_sha256, final_file_path).
         """
         file_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -215,9 +232,12 @@ class IntegrityVerifier:
             final_path = cls.encrypt_file_aes_gcm(file_path, secret)
 
         m_path = manifest_path or (file_path.parent / "manifest.json")
+        manifest_name = manifest_id or (
+            f"content_{hashlib.sha256(file_path.name.encode()).hexdigest()[:16]}"
+        )
         cls._append_manifest(
             manifest_path=m_path,
-            file_name=final_path.name,
+            file_name=manifest_name,
             url=url,
             file_size=file_size,
             sha256=actual_sha256,
@@ -257,6 +277,92 @@ class IntegrityVerifier:
             os.fsync(f.fileno())
         file_path.unlink()
         return enc_path
+
+    @classmethod
+    def encrypt_file_streaming(
+        cls,
+        file_path: Path,
+        passphrase: str,
+        chunk_size: int = 1024 * 1024,
+    ) -> Path:
+        """
+        Encrypt a large file in bounded-memory chunks using EncryptedFileSession.
+
+        The resulting .enc/.idx pair is compatible with ``torpool decrypt``.
+        The plaintext file is shredded after ciphertext finalization.
+        """
+        total_size = file_path.stat().st_size
+        enc_path = file_path.with_name(f"{file_path.name}.enc")
+        idx_path = file_path.with_name(f"{file_path.name}.idx")
+        session = EncryptedFileSession(enc_path, idx_path, passphrase, total_size)
+        offset = 0
+        chunk_id = 0
+        with file_path.open("rb") as f:
+            while data := f.read(chunk_size):
+                chunk = ChunkRecord(
+                    chunk_id=chunk_id,
+                    start_byte=offset,
+                    end_byte=offset + len(data) - 1,
+                )
+                session.write_chunk(chunk, data)
+                offset += len(data)
+                chunk_id += 1
+        session.finalize()
+        cls.shred_file(file_path)
+        return enc_path
+
+    @classmethod
+    def verify_torrent_file(
+        cls,
+        file_path: Path,
+        relative_path: str,
+        source_label: str,
+        expected_sha256: Optional[str] = None,
+        manifest_path: Optional[Path] = None,
+        encrypt: bool = False,
+        passphrase: Optional[str] = None,
+        manifest_id: Optional[str] = None,
+    ) -> tuple[bool, str, Path]:
+        """
+        Hash, optionally encrypt, and record one completed torrent content file.
+
+        Torrent manifests deliberately use opaque content IDs rather than file
+        names so the manifest does not disclose payload names.
+        """
+        file_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(file_path.parent, 0o700)
+        os.chmod(file_path, 0o600)
+        actual_sha256 = cls.compute_sha256(file_path)
+        file_size = file_path.stat().st_size
+        passed = True
+        if expected_sha256:
+            passed = actual_sha256.lower() == expected_sha256.strip().lower()
+
+        final_path = file_path
+        if not passed:
+            failed_path = file_path.with_name(f"{file_path.name}.failed.{int(time.time())}")
+            file_path.rename(failed_path)
+            os.chmod(failed_path, 0o600)
+            final_path = failed_path
+        elif encrypt and not file_path.name.endswith(".enc"):
+            secret = passphrase or os.environ.get("TORPOOL_PASSPHRASE") or secrets.token_hex(16)
+            final_path = cls.encrypt_file_streaming(file_path, secret)
+
+        m_path = manifest_path or (file_path.parent / "manifest.json")
+        manifest_name = (
+            manifest_id or f"content_{hashlib.sha256(relative_path.encode()).hexdigest()[:16]}"
+        )
+        cls._append_manifest(
+            manifest_path=m_path,
+            file_name=manifest_name,
+            url=source_label,
+            file_size=file_size,
+            sha256=actual_sha256,
+            expected_sha256=expected_sha256,
+            status="VERIFIED" if passed else "FAILED_INTEGRITY",
+            encrypted=bool(passed and encrypt),
+        )
+        return passed, actual_sha256, final_path
 
     @classmethod
     def decrypt_file(
@@ -419,7 +525,11 @@ class IntegrityVerifier:
                 "encrypted": encrypted,
             }
         )
-        fd = os.open(manifest_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        fd = os.open(
+            manifest_path,
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, json.dumps(entries, indent=2).encode("utf-8"))
